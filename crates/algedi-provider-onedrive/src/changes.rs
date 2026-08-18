@@ -81,6 +81,11 @@ impl CloudProvider for OneDriveProvider {
         Ok(to_remote_file(folder))
     }
 
+    async fn update(&self, local_path: &Path, remote_id: &str) -> ProviderResult<RemoteFile> {
+        let item = self.api.update_item(local_path, remote_id).await?;
+        Ok(to_remote_file(item))
+    }
+
     async fn download(&self, remote_id: &str, dest_path: &Path) -> ProviderResult<()> {
         self.api.download_item(remote_id, dest_path).await
     }

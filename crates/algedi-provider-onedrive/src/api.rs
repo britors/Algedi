@@ -167,6 +167,69 @@ impl GraphApi {
         decode_json(response, name).await
     }
 
+    pub async fn update_item(&self, local_path: &Path, item_id: &str) -> ProviderResult<DriveItem> {
+        let name = local_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| {
+                ProviderError::Other("local path has no valid UTF-8 file name".into())
+            })?;
+        let size = tokio::fs::metadata(local_path)
+            .await
+            .map_err(io_error)?
+            .len();
+        if size <= SIMPLE_UPLOAD_LIMIT {
+            let body = tokio::fs::read(local_path).await.map_err(io_error)?;
+            let response = self
+                .http
+                .put(format!("{GRAPH_BASE}/me/drive/items/{item_id}/content"))
+                .bearer_auth(self.access_token())
+                .body(body)
+                .send()
+                .await
+                .map_err(network_error)?;
+            return decode_json(response, name).await;
+        }
+        let response = self
+            .http
+            .post(format!(
+                "{GRAPH_BASE}/me/drive/items/{item_id}/createUploadSession"
+            ))
+            .bearer_auth(self.access_token())
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .map_err(network_error)?;
+        let session: UploadSession = decode_json(response, name).await?;
+        let mut file = tokio::fs::File::open(local_path).await.map_err(io_error)?;
+        let mut offset = 0u64;
+        loop {
+            let count = ((size - offset) as usize).min(UPLOAD_CHUNK_SIZE);
+            let mut bytes = vec![0u8; count];
+            tokio::io::AsyncReadExt::read_exact(&mut file, &mut bytes)
+                .await
+                .map_err(io_error)?;
+            let end = offset + count as u64 - 1;
+            let response = self
+                .http
+                .put(&session.upload_url)
+                .header(reqwest::header::CONTENT_LENGTH, count)
+                .header(
+                    reqwest::header::CONTENT_RANGE,
+                    format!("bytes {offset}-{end}/{size}"),
+                )
+                .body(bytes)
+                .send()
+                .await
+                .map_err(network_error)?;
+            if response.status() == reqwest::StatusCode::ACCEPTED {
+                offset = end + 1;
+                continue;
+            }
+            return decode_json(response, name).await;
+        }
+    }
+
     pub async fn download_item(&self, item_id: &str, dest_path: &Path) -> ProviderResult<()> {
         let mut response = self
             .http

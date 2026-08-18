@@ -129,6 +129,52 @@ impl GDriveApi {
         decode_json(response, name).await
     }
 
+    pub async fn update_file(&self, local_path: &Path, file_id: &str) -> ProviderResult<DriveFile> {
+        let name = local_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| {
+                ProviderError::Other("local path has no valid UTF-8 file name".into())
+            })?;
+        let size = tokio::fs::metadata(local_path)
+            .await
+            .map_err(io_error)?
+            .len();
+        let response = self
+            .http
+            .patch(format!("{UPLOAD_BASE}/files/{file_id}"))
+            .bearer_auth(self.access_token())
+            .query(&[("uploadType", "resumable"), ("fields", FIELDS)])
+            .header("X-Upload-Content-Type", "application/octet-stream")
+            .header("X-Upload-Content-Length", size)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .map_err(network_error)?;
+        if !response.status().is_success() {
+            return Err(response_error(response, file_id).await);
+        }
+        let session = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                ProviderError::Other("Drive resumable update returned no Location header".into())
+            })?;
+        let file = tokio::fs::File::open(local_path).await.map_err(io_error)?;
+        let response = self
+            .http
+            .put(session)
+            .header(reqwest::header::CONTENT_LENGTH, size)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .body(reqwest::Body::wrap_stream(ReaderStream::new(file)))
+            .send()
+            .await
+            .map_err(network_error)?;
+        decode_json(response, name).await
+    }
+
     pub async fn download_file(&self, file_id: &str, dest_path: &Path) -> ProviderResult<()> {
         let mut response = self
             .http

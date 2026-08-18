@@ -71,6 +71,13 @@ pub trait CloudProvider: Send + Sync {
     async fn upload(&self, local_path: &Path, remote_parent_id: &str)
         -> ProviderResult<RemoteFile>;
 
+    async fn update(&self, local_path: &Path, remote_id: &str) -> ProviderResult<RemoteFile> {
+        let _ = (local_path, remote_id);
+        Err(ProviderError::Other(
+            "updating file content is not supported by this provider".into(),
+        ))
+    }
+
     async fn create_folder(
         &self,
         name: &str,

@@ -173,6 +173,23 @@ impl StateDb {
         }
     }
 
+    pub fn remote_id_for_relative_path(
+        &self,
+        pair_id: PairId,
+        relative_path: &str,
+    ) -> rusqlite::Result<Option<String>> {
+        let result = self.conn.query_row(
+            "SELECT remote_id FROM files WHERE pair_id = ?1 AND relative_path = ?2",
+            params![pair_id.to_string(), relative_path],
+            |row| row.get(0),
+        );
+        match result {
+            Ok(id) => Ok(id),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Records the given hashes for `relative_path` under `status` (one of
     /// the `SyncStatus::as_str()` values). Used directly when the status
     /// isn't plain `"synced"` — e.g. `apply_conflict` marks the

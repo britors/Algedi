@@ -15,6 +15,10 @@ pub enum SyncAction {
         relative_path: String,
         remote: RemoteFile,
     },
+    Update {
+        relative_path: String,
+        remote: RemoteFile,
+    },
     Download {
         relative_path: String,
         remote: RemoteFile,
@@ -36,6 +40,7 @@ impl SyncAction {
     pub fn relative_path(&self) -> Option<&str> {
         match self {
             SyncAction::Upload { relative_path, .. }
+            | SyncAction::Update { relative_path, .. }
             | SyncAction::Download { relative_path, .. }
             | SyncAction::Conflict { relative_path, .. }
             | SyncAction::DeleteLocal { relative_path } => Some(relative_path),
@@ -121,6 +126,70 @@ impl SyncEngine {
         Ok(actions)
     }
 
+    pub fn local_action(&self, path: &std::path::Path) -> anyhow::Result<Option<SyncAction>> {
+        let is_partial_download = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".algedi-part"));
+        if !path.exists() || is_partial_download {
+            return Ok(None);
+        }
+        let relative = match path.strip_prefix(&self.pair.local_path) {
+            Ok(path) if !path.as_os_str().is_empty() => path,
+            _ => return Ok(None),
+        };
+        let relative_path = relative
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        let state = self.state.lock().unwrap();
+        let remote_id = state.remote_id_for_relative_path(self.pair.id, &relative_path)?;
+        let (known_local_hash, remote_hash) = state.get_hashes(self.pair.id, &relative_path)?;
+        let is_folder = path.is_dir();
+        let current_hash = if is_folder {
+            None
+        } else {
+            Some(crate::hash_file(path)?)
+        };
+        if remote_id.is_some() && (is_folder || current_hash == known_local_hash) {
+            return Ok(None);
+        }
+        let parent_relative = relative
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/"));
+        let parent_id = match parent_relative {
+            Some(parent) => state.remote_id_for_relative_path(self.pair.id, &parent)?,
+            None => Some(self.pair.remote_folder_id.clone()),
+        };
+        let Some(parent_id) = parent_id else {
+            return Ok(None);
+        };
+        let remote = RemoteFile {
+            remote_id: remote_id.clone().unwrap_or_default(),
+            name: relative.file_name().unwrap().to_string_lossy().into_owned(),
+            parent_id: Some(parent_id),
+            is_folder,
+            size: if is_folder {
+                0
+            } else {
+                std::fs::metadata(path)?.len()
+            },
+            content_hash: remote_hash,
+            modified_at: chrono::Utc::now(),
+        };
+        Ok(Some(if remote_id.is_some() {
+            SyncAction::Update {
+                relative_path,
+                remote,
+            }
+        } else {
+            SyncAction::Upload {
+                relative_path,
+                remote,
+            }
+        }))
+    }
+
     /// Compares a single remote change against the last-known synced hashes
     /// for that path, per the three-scenario table in PROMPT-ALGEDI.md
     /// sec. 5.2.
@@ -195,6 +264,10 @@ impl SyncEngine {
                 relative_path,
                 remote,
             } => self.apply_upload(relative_path, remote).await,
+            SyncAction::Update {
+                relative_path,
+                remote,
+            } => self.apply_update(relative_path, remote).await,
             SyncAction::Conflict {
                 relative_path,
                 remote,
@@ -287,6 +360,24 @@ impl SyncEngine {
             Some(&uploaded.remote_id),
             Some(&local_hash),
             uploaded.content_hash.as_deref(),
+        )?;
+        Ok(())
+    }
+
+    async fn apply_update(
+        &mut self,
+        relative_path: &str,
+        remote: &RemoteFile,
+    ) -> anyhow::Result<()> {
+        let local_path = self.pair.local_path.join(relative_path);
+        let updated = self.provider.update(&local_path, &remote.remote_id).await?;
+        let local_hash = crate::hash_file(&local_path)?;
+        self.state.lock().unwrap().record_synced(
+            self.pair.id,
+            relative_path,
+            Some(&updated.remote_id),
+            Some(&local_hash),
+            updated.content_hash.as_deref(),
         )?;
         Ok(())
     }
@@ -961,5 +1052,41 @@ mod tests {
                 .unwrap(),
             SyncStatus::Conflict
         );
+    }
+
+    #[test]
+    fn local_changes_distinguish_new_updated_and_unchanged_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let new_path = dir.path().join("new.txt");
+        let known_path = dir.path().join("known.txt");
+        std::fs::write(&new_path, b"new").unwrap();
+        std::fs::write(&known_path, b"before").unwrap();
+        let state = Arc::new(Mutex::new(StateDb::open_in_memory().unwrap()));
+        let pair = test_pair(dir.path().to_path_buf());
+        state.lock().unwrap().insert_folder_pair(&pair).unwrap();
+        let known_hash = crate::hash_file(&known_path).unwrap();
+        state
+            .lock()
+            .unwrap()
+            .record_synced(
+                pair.id,
+                "known.txt",
+                Some("remote-known"),
+                Some(&known_hash),
+                Some("remote-hash"),
+            )
+            .unwrap();
+        let engine = SyncEngine::new(pair, Arc::new(FakeProvider::new(Vec::new())), state);
+
+        assert!(matches!(
+            engine.local_action(&new_path).unwrap(),
+            Some(SyncAction::Upload { .. })
+        ));
+        assert!(engine.local_action(&known_path).unwrap().is_none());
+        std::fs::write(&known_path, b"after").unwrap();
+        assert!(matches!(
+            engine.local_action(&known_path).unwrap(),
+            Some(SyncAction::Update { remote, .. }) if remote.remote_id == "remote-known"
+        ));
     }
 }

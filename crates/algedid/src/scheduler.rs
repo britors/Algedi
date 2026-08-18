@@ -5,9 +5,10 @@
 
 use crate::account_manager::AccountManager;
 use crate::dbus_service::Algedi1;
-use algedi_core::{SyncAction, SyncEngine};
+use algedi_core::{FolderWatcher, PairId, SyncAction, SyncEngine};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use zbus::object_server::InterfaceRef;
 
@@ -16,12 +17,80 @@ use zbus::object_server::InterfaceRef;
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(60);
 pub const MIN_POLL_INTERVAL: Duration = Duration::from_secs(15);
 
-pub async fn run_forever(accounts: Arc<Mutex<AccountManager>>, conn: zbus::Connection) -> anyhow::Result<()> {
-    let iface: InterfaceRef<Algedi1> = conn.object_server().interface("/org/lyraos/Algedi1").await?;
+pub async fn run_forever(
+    accounts: Arc<Mutex<AccountManager>>,
+    conn: zbus::Connection,
+) -> anyhow::Result<()> {
+    let iface: InterfaceRef<Algedi1> = conn
+        .object_server()
+        .interface("/org/lyraos/Algedi1")
+        .await?;
 
-    let mut ticker = tokio::time::interval(DEFAULT_POLL_INTERVAL);
+    let mut ticker = tokio::time::interval(Duration::from_millis(100));
+    let remote_poll_interval = DEFAULT_POLL_INTERVAL.max(MIN_POLL_INTERVAL);
+    let mut next_remote_poll = Instant::now();
+    let mut watchers: HashMap<PairId, FolderWatcher> = HashMap::new();
     loop {
         ticker.tick().await;
+
+        let (available, state) = {
+            let accounts = accounts.lock().await;
+            (accounts.due_syncs(), accounts.state_handle())
+        };
+        let active: HashSet<_> = available.iter().map(|(pair, _)| pair.id).collect();
+        watchers.retain(|pair_id, _| active.contains(pair_id));
+        for (pair, _) in &available {
+            if let std::collections::hash_map::Entry::Vacant(entry) = watchers.entry(pair.id) {
+                match FolderWatcher::watch(&pair.local_path) {
+                    Ok(watcher) => {
+                        entry.insert(watcher);
+                    }
+                    Err(err) => {
+                        tracing::warn!(pair_id = %pair.id, %err, "failed to watch local folder")
+                    }
+                }
+            }
+        }
+
+        for (pair, provider) in &available {
+            let Some(watcher) = watchers.get(&pair.id) else {
+                continue;
+            };
+            while let Some(change) = watcher.try_recv() {
+                let mut engine = SyncEngine::new(pair.clone(), provider.clone(), state.clone());
+                let action = match engine.local_action(&change.path) {
+                    Ok(Some(action)) => action,
+                    Ok(None) => continue,
+                    Err(err) => {
+                        tracing::warn!(pair_id = %pair.id, path = %change.path.display(), %err, "failed to classify local change");
+                        continue;
+                    }
+                };
+                if let Err(err) = engine.apply(&action).await {
+                    tracing::warn!(pair_id = %pair.id, ?action, %err, "failed to apply local change");
+                    continue;
+                }
+                if let Some(relative_path) = action.relative_path() {
+                    let local_path = pair
+                        .local_path
+                        .join(relative_path)
+                        .to_string_lossy()
+                        .into_owned();
+                    emit_status_changed(
+                        &iface,
+                        &local_path,
+                        engine.status_for(relative_path).as_str(),
+                    )
+                    .await;
+                }
+                emit_sync_progress(&iface, &pair.id.to_string(), 100).await;
+            }
+        }
+
+        if Instant::now() < next_remote_poll {
+            continue;
+        }
+        next_remote_poll = Instant::now() + remote_poll_interval;
 
         // Refresh expiring credentials, then snapshot due work and release
         // the AccountManager lock before running any sync cycle.
@@ -55,12 +124,20 @@ pub async fn run_forever(accounts: Arc<Mutex<AccountManager>>, conn: zbus::Conne
                 match engine.apply(action).await {
                     Ok(()) => {
                         if let Some(relative_path) = action.relative_path() {
-                            let local_path = local_root.join(relative_path).to_string_lossy().into_owned();
+                            let local_path = local_root
+                                .join(relative_path)
+                                .to_string_lossy()
+                                .into_owned();
                             let status = engine.status_for(relative_path);
                             emit_status_changed(&iface, &local_path, status.as_str()).await;
 
                             if matches!(action, SyncAction::Conflict { .. }) {
-                                emit_conflict_detected(&iface, &local_path, &account_id.to_string()).await;
+                                emit_conflict_detected(
+                                    &iface,
+                                    &local_path,
+                                    &account_id.to_string(),
+                                )
+                                .await;
                             }
                         }
                     }
@@ -132,7 +209,9 @@ mod tests {
             .path(path)
             .unwrap()
             .build();
-        let mut stream = MessageStream::for_match_rule(rule, &listener, None).await.unwrap();
+        let mut stream = MessageStream::for_match_rule(rule, &listener, None)
+            .await
+            .unwrap();
 
         emit_status_changed(&iface, "/tmp/notes.txt", "synced").await;
         emit_conflict_detected(&iface, "/tmp/notes.txt", "account-1").await;
@@ -153,7 +232,8 @@ mod tests {
                         seen.insert("StatusChanged");
                     }
                     "ConflictDetected" => {
-                        let (path, account_id): (String, String) = msg.body().deserialize().unwrap();
+                        let (path, account_id): (String, String) =
+                            msg.body().deserialize().unwrap();
                         assert_eq!(path, "/tmp/notes.txt");
                         assert_eq!(account_id, "account-1");
                         seen.insert("ConflictDetected");
