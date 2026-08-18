@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+<!--
+  org.lyraos.Algedi1 — interface exposed by algedid over the session bus.
+  See PROMPT-ALGEDI.md sec. 8. Keep in sync with
+  crates/algedid/src/dbus_service.rs and
+  crates/algedi-configurator/src/dbus_client.rs.
+-->
+<node>
+  <interface name="org.lyraos.Algedi1">
+    <method name="AddAccount">
+      <arg name="provider" type="s" direction="in"/>
+      <arg name="account_id" type="s" direction="out"/>
+    </method>
+    <method name="RemoveAccount">
+      <arg name="account_id" type="s" direction="in"/>
+    </method>
+    <method name="ListAccounts">
+      <!-- (account_id, provider, email) -->
+      <arg name="accounts" type="a(sss)" direction="out"/>
+    </method>
+    <method name="AddFolderPair">
+      <arg name="account_id" type="s" direction="in"/>
+      <arg name="local_path" type="s" direction="in"/>
+      <arg name="remote_path" type="s" direction="in"/>
+      <arg name="pair_id" type="s" direction="out"/>
+    </method>
+    <method name="RemoveFolderPair">
+      <arg name="pair_id" type="s" direction="in"/>
+    </method>
+    <method name="GetFileStatus">
+      <arg name="local_path" type="s" direction="in"/>
+      <!-- synced|syncing|conflict|paused|unknown -->
+      <arg name="status" type="s" direction="out"/>
+    </method>
+    <method name="GetPairForPath">
+      <!-- Resolves the folder pair owning local_path, for thin clients
+           (Nautilus extension, Vega) driving PauseSync/ResumeSync/SyncNow.
+           pair_id is empty when no pair owns the path. -->
+      <arg name="local_path" type="s" direction="in"/>
+      <arg name="pair_id" type="s" direction="out"/>
+      <arg name="account_id" type="s" direction="out"/>
+      <arg name="provider" type="s" direction="out"/>
+      <arg name="paused" type="b" direction="out"/>
+    </method>
+    <method name="PauseSync">
+      <arg name="pair_id" type="s" direction="in"/>
+    </method>
+    <method name="ResumeSync">
+      <arg name="pair_id" type="s" direction="in"/>
+    </method>
+    <method name="SyncNow">
+      <arg name="pair_id" type="s" direction="in"/>
+    </method>
+    <method name="ListConflicts">
+      <!-- (path, account_id, timestamp) -->
+      <arg name="conflicts" type="a(sss)" direction="out"/>
+    </method>
+
+    <signal name="StatusChanged">
+      <arg name="local_path" type="s"/>
+      <arg name="status" type="s"/>
+    </signal>
+    <signal name="ConflictDetected">
+      <arg name="path" type="s"/>
+      <arg name="account_id" type="s"/>
+    </signal>
+    <signal name="SyncProgress">
+      <arg name="pair_id" type="s"/>
+      <arg name="percent" type="i"/>
+    </signal>
+  </interface>
+</node>

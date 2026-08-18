@@ -1,0 +1,29 @@
+[package]
+name = "algedid"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "algedid"
+path = "src/main.rs"
+
+[dependencies]
+algedi-core = { path = "../algedi-core" }
+algedi-provider-trait = { path = "../algedi-provider-trait" }
+algedi-provider-gdrive = { path = "../algedi-provider-gdrive" }
+algedi-provider-onedrive = { path = "../algedi-provider-onedrive" }
+tokio = { workspace = true }
+zbus = { workspace = true }
+uuid = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+oo7 = "0.3"
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
+futures-util = "0.3"

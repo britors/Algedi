@@ -1,0 +1,10 @@
+/target
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+.direnv
+.flatpak-builder
+build-dir
+repo/
+__pycache__/
+*.pyc

@@ -1,0 +1,17 @@
+[Unit]
+Description=Algedi cloud sync daemon
+Documentation=https://github.com/lyraos/algedi
+After=graphical-session-pre.target network-online.target
+Wants=network-online.target
+PartOf=graphical-session.target
+
+[Service]
+Type=dbus
+BusName=org.lyraos.Algedi1
+ExecStart=/usr/libexec/algedi/algedid
+Restart=on-failure
+RestartSec=5
+Slice=background.slice
+
+[Install]
+WantedBy=default.target

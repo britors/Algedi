@@ -1,0 +1,22 @@
+[package]
+name = "algedi-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+algedi-provider-trait = { path = "../algedi-provider-trait" }
+notify = "6"
+ignore = "0.4"
+rusqlite = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+anyhow = { workspace = true }
+sha2 = "0.10"
+hostname = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true }
+async-trait = { workspace = true }
