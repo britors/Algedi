@@ -103,14 +103,18 @@ impl AccountManager {
     /// or the `ALGEDI_*_CLIENT_ID`/`ALGEDI_*_CLIENT_SECRET` env vars — see
     /// docs/oauth-setup.md.
     pub async fn add_account(&mut self, provider: &str) -> anyhow::Result<AccountId> {
-        let (email, tokens, live_provider): (String, StoredTokens, Arc<dyn CloudProvider>) = match provider {
+        let (email, tokens, live_provider): (String, FreshTokens, Arc<dyn CloudProvider>) = match provider {
             "gdrive" => self.onboard_gdrive().await?,
             "onedrive" => self.onboard_onedrive().await?,
             other => anyhow::bail!("unknown provider '{other}' (expected 'gdrive' or 'onedrive')"),
         };
 
         let account_id = uuid::Uuid::new_v4();
-        secrets::store_tokens(account_id, provider, &email, &tokens).await?;
+        let stored_tokens = StoredTokens {
+            access_token: tokens.access_token,
+            refresh_token: tokens.refresh_token.clone(),
+        };
+        secrets::store_tokens(account_id, provider, &email, &stored_tokens).await?;
 
         self.handles.insert(
             account_id,
@@ -118,13 +122,15 @@ impl AccountManager {
                 account: Account { id: account_id, provider: provider.to_string(), email },
                 pairs: Vec::new(),
                 provider: Some(live_provider),
+                refresh_token: tokens.refresh_token,
+                expires_at: tokens.expires_in_secs.map(|secs| Instant::now() + Duration::from_secs(secs)),
             },
         );
 
         Ok(account_id)
     }
 
-    async fn onboard_gdrive(&self) -> anyhow::Result<(String, StoredTokens, Arc<dyn CloudProvider>)> {
+    async fn onboard_gdrive(&self) -> anyhow::Result<(String, FreshTokens, Arc<dyn CloudProvider>)> {
         let creds = &self.provider_config.gdrive;
         let client_id = creds.client_id.clone().ok_or_else(|| {
             anyhow::anyhow!(
@@ -144,12 +150,16 @@ impl AccountManager {
 
         Ok((
             email,
-            StoredTokens { access_token: tokens.access_token, refresh_token: tokens.refresh_token },
+            FreshTokens {
+                access_token: tokens.access_token,
+                refresh_token: tokens.refresh_token,
+                expires_in_secs: tokens.expires_in_secs,
+            },
             live_provider,
         ))
     }
 
-    async fn onboard_onedrive(&self) -> anyhow::Result<(String, StoredTokens, Arc<dyn CloudProvider>)> {
+    async fn onboard_onedrive(&self) -> anyhow::Result<(String, FreshTokens, Arc<dyn CloudProvider>)> {
         let creds = &self.provider_config.onedrive;
         let client_id = creds.client_id.clone().ok_or_else(|| {
             anyhow::anyhow!(
@@ -174,9 +184,115 @@ impl AccountManager {
 
         Ok((
             email,
-            StoredTokens { access_token: tokens.access_token, refresh_token: tokens.refresh_token },
+            FreshTokens {
+                access_token: tokens.access_token,
+                refresh_token: tokens.refresh_token,
+                expires_in_secs: tokens.expires_in_secs,
+            },
             live_provider,
         ))
+    }
+
+    /// Accounts whose access token expires within `margin` and can be
+    /// refreshed without user interaction.
+    fn accounts_due_for_refresh(&self, margin: Duration) -> Vec<AccountId> {
+        let now = Instant::now();
+        self.handles
+            .iter()
+            .filter(|(_, handle)| {
+                handle.provider.is_some()
+                    && handle.refresh_token.is_some()
+                    && handle
+                        .expires_at
+                        .is_some_and(|expires_at| expires_at.saturating_duration_since(now) <= margin)
+            })
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// Refreshes every token nearing expiry. A failure is isolated to its
+    /// account so other accounts can still refresh and sync on this tick.
+    pub async fn refresh_expiring_tokens(&mut self) {
+        for account_id in self.accounts_due_for_refresh(TOKEN_REFRESH_MARGIN) {
+            if let Err(err) = self.refresh_account(account_id).await {
+                tracing::warn!(%account_id, %err, "failed to refresh OAuth token");
+            }
+        }
+    }
+
+    async fn refresh_account(&mut self, account_id: AccountId) -> anyhow::Result<()> {
+        let (provider_name, email, refresh_token, live_provider) = {
+            let handle = self
+                .handles
+                .get(&account_id)
+                .ok_or_else(|| anyhow::anyhow!("unknown account {account_id}"))?;
+            (
+                handle.account.provider.clone(),
+                handle.account.email.clone(),
+                handle
+                    .refresh_token
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("account {account_id} has no refresh token"))?,
+                handle
+                    .provider
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("account {account_id} has no live provider"))?,
+            )
+        };
+
+        let fresh = match provider_name.as_str() {
+            "gdrive" => {
+                let creds = &self.provider_config.gdrive;
+                let client_id = creds
+                    .client_id
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("Google Drive client_id not configured"))?;
+                let auth = algedi_provider_gdrive::GDriveAuth::new(
+                    client_id,
+                    creds.client_secret.clone(),
+                    0,
+                );
+                let tokens = auth.refresh(&refresh_token).await?;
+                FreshTokens {
+                    access_token: tokens.access_token,
+                    refresh_token: tokens.refresh_token,
+                    expires_in_secs: tokens.expires_in_secs,
+                }
+            }
+            "onedrive" => {
+                let client_id = self
+                    .provider_config
+                    .onedrive
+                    .client_id
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("OneDrive client_id not configured"))?;
+                let auth = algedi_provider_onedrive::OneDriveAuth::new(client_id, 0);
+                let tokens = auth.refresh(&refresh_token).await?;
+                FreshTokens {
+                    access_token: tokens.access_token,
+                    refresh_token: tokens.refresh_token,
+                    expires_in_secs: tokens.expires_in_secs,
+                }
+            }
+            other => anyhow::bail!("cannot refresh unsupported provider '{other}'"),
+        };
+
+        let stored_tokens = StoredTokens {
+            access_token: fresh.access_token.clone(),
+            refresh_token: fresh.refresh_token.clone(),
+        };
+        secrets::store_tokens(account_id, &provider_name, &email, &stored_tokens).await?;
+        live_provider.set_access_token(fresh.access_token);
+
+        let handle = self
+            .handles
+            .get_mut(&account_id)
+            .ok_or_else(|| anyhow::anyhow!("account {account_id} disappeared during refresh"))?;
+        handle.refresh_token = fresh.refresh_token;
+        handle.expires_at = fresh
+            .expires_in_secs
+            .map(|secs| Instant::now() + Duration::from_secs(secs));
+        Ok(())
     }
 
     pub async fn remove_account(&mut self, id: AccountId) -> anyhow::Result<()> {
@@ -346,6 +462,8 @@ impl AccountManager {
                 },
                 pairs: vec![pair],
                 provider: None,
+                refresh_token: None,
+                expires_at: None,
             },
         );
         pair_id
@@ -355,6 +473,71 @@ impl AccountManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use algedi_provider_trait::{
+        ChangeCursor, ProviderError, ProviderResult, RemoteChange, RemoteFile,
+    };
+
+    struct NoopProvider;
+
+    #[async_trait::async_trait]
+    impl CloudProvider for NoopProvider {
+        fn provider_id(&self) -> &'static str {
+            "noop"
+        }
+
+        async fn list_changes(
+            &self,
+            _cursor: Option<&ChangeCursor>,
+        ) -> ProviderResult<(Vec<RemoteChange>, ChangeCursor)> {
+            Ok((Vec::new(), String::new()))
+        }
+
+        async fn upload(&self, _local_path: &Path, _remote_parent_id: &str) -> ProviderResult<RemoteFile> {
+            Err(ProviderError::Other("not used in this test".into()))
+        }
+
+        async fn download(&self, _remote_id: &str, _dest_path: &Path) -> ProviderResult<()> {
+            Err(ProviderError::Other("not used in this test".into()))
+        }
+
+        async fn delete(&self, _remote_id: &str) -> ProviderResult<()> {
+            Err(ProviderError::Other("not used in this test".into()))
+        }
+
+        async fn get_metadata(&self, _remote_id: &str) -> ProviderResult<RemoteFile> {
+            Err(ProviderError::Other("not used in this test".into()))
+        }
+
+        fn web_url(&self, _remote_id: &str) -> String {
+            String::new()
+        }
+
+        fn set_access_token(&self, _access_token: String) {}
+    }
+
+    fn insert_refresh_test_account(
+        mgr: &mut AccountManager,
+        expires_at: Option<Instant>,
+        refresh_token: Option<&str>,
+        has_provider: bool,
+    ) -> AccountId {
+        let id = uuid::Uuid::new_v4();
+        mgr.handles.insert(
+            id,
+            AccountHandle {
+                account: Account {
+                    id,
+                    provider: "gdrive".into(),
+                    email: "test@example.com".into(),
+                },
+                pairs: Vec::new(),
+                provider: has_provider.then(|| Arc::new(NoopProvider) as Arc<dyn CloudProvider>),
+                refresh_token: refresh_token.map(str::to_owned),
+                expires_at,
+            },
+        );
+        id
+    }
 
     #[test]
     fn resolves_to_the_most_specific_pair() {
@@ -386,6 +569,41 @@ mod tests {
         assert_eq!(
             mgr.file_status(PathBuf::from("/home/user/other/file.txt")),
             SyncStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn selects_only_refreshable_accounts_nearing_expiry() {
+        let mut mgr = AccountManager::new_for_test();
+        let due = insert_refresh_test_account(
+            &mut mgr,
+            Some(Instant::now() + Duration::from_secs(60)),
+            Some("refresh-token"),
+            true,
+        );
+        insert_refresh_test_account(
+            &mut mgr,
+            Some(Instant::now() + Duration::from_secs(600)),
+            Some("refresh-token"),
+            true,
+        );
+        insert_refresh_test_account(
+            &mut mgr,
+            Some(Instant::now() + Duration::from_secs(60)),
+            None,
+            true,
+        );
+        insert_refresh_test_account(
+            &mut mgr,
+            Some(Instant::now() + Duration::from_secs(60)),
+            Some("refresh-token"),
+            false,
+        );
+        insert_refresh_test_account(&mut mgr, None, Some("refresh-token"), true);
+
+        assert_eq!(
+            mgr.accounts_due_for_refresh(Duration::from_secs(5 * 60)),
+            vec![due]
         );
     }
 }

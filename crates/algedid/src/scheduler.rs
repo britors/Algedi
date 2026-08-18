@@ -23,11 +23,11 @@ pub async fn run_forever(accounts: Arc<Mutex<AccountManager>>, conn: zbus::Conne
     loop {
         ticker.tick().await;
 
-        // Snapshot due work and release the AccountManager lock before
-        // running any cycle: a slow network round-trip for one account must
-        // never block D-Bus calls or other accounts' cycles.
+        // Refresh expiring credentials, then snapshot due work and release
+        // the AccountManager lock before running any sync cycle.
         let (due, state) = {
-            let accounts = accounts.lock().await;
+            let mut accounts = accounts.lock().await;
+            accounts.refresh_expiring_tokens().await;
             (accounts.due_syncs(), accounts.state_handle())
         };
 

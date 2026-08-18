@@ -107,6 +107,7 @@ dependencies = [
  "algedi-provider-onedrive",
  "algedi-provider-trait",
  "anyhow",
+ "async-trait",
  "futures-util",
  "oo7",
  "serde",

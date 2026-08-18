@@ -128,8 +128,6 @@ retorna o `account_id` da conta recém-criada.
 - ✅ Captura do redirect loopback (`tiny_http`), troca de código por token,
   refresh de token, revogação, e persistência via Secret Service — tudo
   implementado e coberto por testes (veja `cargo test --workspace`).
-- ⚠️ Refresh automático de `access_token` expirado **antes** de cada
-  chamada de API ainda não está ligado ao ciclo de sync — hoje o token
-  obtido na autorização é usado como está; se expirar no meio de uma sessão
-  longa do daemon, as chamadas à API vão falhar até uma reautenticação
-  manual. Fica como próximo passo.
+- ✅ O scheduler renova automaticamente o `access_token` cinco minutos antes
+  da expiração, persiste o novo conjunto de tokens no Secret Service e o
+  instala atomicamente no adaptador antes de iniciar o próximo ciclo de sync.
