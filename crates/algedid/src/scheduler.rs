@@ -106,17 +106,25 @@ pub async fn run_forever(
             }
         }
 
-        if Instant::now() < next_remote_poll {
+        let requested = accounts.lock().await.take_sync_requests();
+        let periodic_poll = Instant::now() >= next_remote_poll;
+        if !periodic_poll && requested.is_empty() {
             continue;
         }
-        next_remote_poll = Instant::now() + remote_poll_interval;
+        if periodic_poll {
+            next_remote_poll = Instant::now() + remote_poll_interval;
+        }
 
         // Refresh expiring credentials, then snapshot due work and release
         // the AccountManager lock before running any sync cycle.
         let (due, state) = {
             let mut accounts = accounts.lock().await;
             accounts.refresh_expiring_tokens().await;
-            (accounts.due_syncs(), accounts.state_handle())
+            let mut due = accounts.due_syncs();
+            if !periodic_poll {
+                due.retain(|(pair, _)| requested.contains(&pair.id));
+            }
+            (due, accounts.state_handle())
         };
 
         if due.is_empty() {

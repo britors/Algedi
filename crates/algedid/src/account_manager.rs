@@ -6,7 +6,7 @@ use crate::provider_config::ProviderConfig;
 use crate::secrets::{self, StoredTokens};
 use algedi_core::{AccountId, FolderPair, PairId, StateDb, SyncStatus};
 use algedi_provider_trait::CloudProvider;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -62,6 +62,7 @@ pub struct AccountManager {
     state: Arc<Mutex<StateDb>>,
     handles: HashMap<AccountId, AccountHandle>,
     provider_config: ProviderConfig,
+    pending_syncs: HashSet<PairId>,
 }
 
 impl AccountManager {
@@ -70,6 +71,7 @@ impl AccountManager {
             state: Arc::new(Mutex::new(StateDb::open(&state_db_path)?)),
             handles: HashMap::new(),
             provider_config: ProviderConfig::load(),
+            pending_syncs: HashSet::new(),
         })
     }
 
@@ -373,6 +375,7 @@ impl AccountManager {
     }
 
     pub async fn remove_folder_pair(&mut self, pair_id: PairId) -> anyhow::Result<()> {
+        self.pending_syncs.remove(&pair_id);
         self.state.lock().unwrap().remove_folder_pair(pair_id)?;
         for handle in self.handles.values_mut() {
             handle.pairs.retain(|p| p.id != pair_id);
@@ -431,13 +434,35 @@ impl AccountManager {
                 pair.paused = paused;
             }
         }
+        if paused {
+            self.pending_syncs.remove(&pair_id);
+        }
         Ok(())
     }
 
-    pub async fn trigger_sync(&mut self, _pair_id: PairId) -> anyhow::Result<()> {
-        // TODO: signal the corresponding scheduler task to run an immediate
-        // cycle instead of waiting for the next poll tick.
+    pub async fn trigger_sync(&mut self, pair_id: PairId) -> anyhow::Result<()> {
+        let (handle, pair) = self
+            .handles
+            .values()
+            .find_map(|handle| {
+                handle
+                    .pairs
+                    .iter()
+                    .find(|pair| pair.id == pair_id)
+                    .map(|pair| (handle, pair))
+            })
+            .ok_or_else(|| anyhow::anyhow!("unknown folder pair {pair_id}"))?;
+        anyhow::ensure!(!pair.paused, "folder pair {pair_id} is paused");
+        anyhow::ensure!(
+            handle.provider.is_some(),
+            "folder pair {pair_id} has no active provider"
+        );
+        self.pending_syncs.insert(pair_id);
         Ok(())
+    }
+
+    pub fn take_sync_requests(&mut self) -> HashSet<PairId> {
+        std::mem::take(&mut self.pending_syncs)
     }
 
     pub fn list_conflicts(&self) -> Vec<ConflictRecord> {
@@ -475,6 +500,7 @@ impl AccountManager {
             state: Arc::new(Mutex::new(StateDb::open_in_memory().unwrap())),
             handles: HashMap::new(),
             provider_config: ProviderConfig::default(),
+            pending_syncs: HashSet::new(),
         }
     }
 
@@ -646,5 +672,25 @@ mod tests {
             mgr.accounts_due_for_refresh(Duration::from_secs(5 * 60)),
             vec![due]
         );
+    }
+
+    #[tokio::test]
+    async fn sync_requests_are_validated_and_coalesced() {
+        let mut mgr = AccountManager::new_for_test();
+        let active = mgr.insert_test_pair("gdrive", PathBuf::from("/tmp/active"), false);
+        let paused = mgr.insert_test_pair("gdrive", PathBuf::from("/tmp/paused"), true);
+        let active_account = mgr
+            .handles
+            .values_mut()
+            .find(|handle| handle.pairs.iter().any(|pair| pair.id == active))
+            .unwrap();
+        active_account.provider = Some(Arc::new(NoopProvider));
+
+        mgr.trigger_sync(active).await.unwrap();
+        mgr.trigger_sync(active).await.unwrap();
+        assert!(mgr.trigger_sync(paused).await.is_err());
+        assert!(mgr.trigger_sync(uuid::Uuid::new_v4()).await.is_err());
+        assert_eq!(mgr.take_sync_requests(), HashSet::from([active]));
+        assert!(mgr.take_sync_requests().is_empty());
     }
 }
