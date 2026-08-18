@@ -79,6 +79,10 @@ impl AccountManager {
         self.state.clone()
     }
 
+    pub fn poll_interval_secs(&self) -> Option<u64> {
+        self.provider_config.poll_interval_secs()
+    }
+
     /// Every unpaused (pair, provider) ready to run a sync cycle. Accounts
     /// whose onboarding hasn't produced a live provider yet (all of them,
     /// until OAuth is implemented) are skipped.
@@ -103,11 +107,14 @@ impl AccountManager {
     /// or the `ALGEDI_*_CLIENT_ID`/`ALGEDI_*_CLIENT_SECRET` env vars — see
     /// docs/oauth-setup.md.
     pub async fn add_account(&mut self, provider: &str) -> anyhow::Result<AccountId> {
-        let (email, tokens, live_provider): (String, FreshTokens, Arc<dyn CloudProvider>) = match provider {
-            "gdrive" => self.onboard_gdrive().await?,
-            "onedrive" => self.onboard_onedrive().await?,
-            other => anyhow::bail!("unknown provider '{other}' (expected 'gdrive' or 'onedrive')"),
-        };
+        let (email, tokens, live_provider): (String, FreshTokens, Arc<dyn CloudProvider>) =
+            match provider {
+                "gdrive" => self.onboard_gdrive().await?,
+                "onedrive" => self.onboard_onedrive().await?,
+                other => {
+                    anyhow::bail!("unknown provider '{other}' (expected 'gdrive' or 'onedrive')")
+                }
+            };
 
         let account_id = uuid::Uuid::new_v4();
         let stored_tokens = StoredTokens {
@@ -119,18 +126,26 @@ impl AccountManager {
         self.handles.insert(
             account_id,
             AccountHandle {
-                account: Account { id: account_id, provider: provider.to_string(), email },
+                account: Account {
+                    id: account_id,
+                    provider: provider.to_string(),
+                    email,
+                },
                 pairs: Vec::new(),
                 provider: Some(live_provider),
                 refresh_token: tokens.refresh_token,
-                expires_at: tokens.expires_in_secs.map(|secs| Instant::now() + Duration::from_secs(secs)),
+                expires_at: tokens
+                    .expires_in_secs
+                    .map(|secs| Instant::now() + Duration::from_secs(secs)),
             },
         );
 
         Ok(account_id)
     }
 
-    async fn onboard_gdrive(&self) -> anyhow::Result<(String, FreshTokens, Arc<dyn CloudProvider>)> {
+    async fn onboard_gdrive(
+        &self,
+    ) -> anyhow::Result<(String, FreshTokens, Arc<dyn CloudProvider>)> {
         let creds = &self.provider_config.gdrive;
         let client_id = creds.client_id.clone().ok_or_else(|| {
             anyhow::anyhow!(
@@ -141,12 +156,16 @@ impl AccountManager {
         })?;
 
         let port = algedi_provider_gdrive::GDriveAuth::find_free_port()?;
-        let auth = algedi_provider_gdrive::GDriveAuth::new(client_id, creds.client_secret.clone(), port);
-        let tokens = auth.authorize(&[algedi_provider_gdrive::SCOPE_DRIVE_FILE]).await?;
+        let auth =
+            algedi_provider_gdrive::GDriveAuth::new(client_id, creds.client_secret.clone(), port);
+        let tokens = auth
+            .authorize(&[algedi_provider_gdrive::SCOPE_DRIVE_FILE])
+            .await?;
         let email = algedi_provider_gdrive::fetch_account_email(&tokens.access_token).await?;
 
         let api = algedi_provider_gdrive::GDriveApi::new(tokens.access_token.clone());
-        let live_provider: Arc<dyn CloudProvider> = Arc::new(algedi_provider_gdrive::GDriveProvider::new(api));
+        let live_provider: Arc<dyn CloudProvider> =
+            Arc::new(algedi_provider_gdrive::GDriveProvider::new(api));
 
         Ok((
             email,
@@ -159,7 +178,9 @@ impl AccountManager {
         ))
     }
 
-    async fn onboard_onedrive(&self) -> anyhow::Result<(String, FreshTokens, Arc<dyn CloudProvider>)> {
+    async fn onboard_onedrive(
+        &self,
+    ) -> anyhow::Result<(String, FreshTokens, Arc<dyn CloudProvider>)> {
         let creds = &self.provider_config.onedrive;
         let client_id = creds.client_id.clone().ok_or_else(|| {
             anyhow::anyhow!(
@@ -180,7 +201,8 @@ impl AccountManager {
         let email = algedi_provider_onedrive::fetch_account_email(&tokens.access_token).await?;
 
         let api = algedi_provider_onedrive::GraphApi::new(tokens.access_token.clone());
-        let live_provider: Arc<dyn CloudProvider> = Arc::new(algedi_provider_onedrive::OneDriveProvider::new(api));
+        let live_provider: Arc<dyn CloudProvider> =
+            Arc::new(algedi_provider_onedrive::OneDriveProvider::new(api));
 
         Ok((
             email,
@@ -202,9 +224,9 @@ impl AccountManager {
             .filter(|(_, handle)| {
                 handle.provider.is_some()
                     && handle.refresh_token.is_some()
-                    && handle
-                        .expires_at
-                        .is_some_and(|expires_at| expires_at.saturating_duration_since(now) <= margin)
+                    && handle.expires_at.is_some_and(|expires_at| {
+                        expires_at.saturating_duration_since(now) <= margin
+                    })
             })
             .map(|(id, _)| *id)
             .collect()
@@ -221,24 +243,23 @@ impl AccountManager {
     }
 
     async fn refresh_account(&mut self, account_id: AccountId) -> anyhow::Result<()> {
-        let (provider_name, email, refresh_token, live_provider) = {
-            let handle = self
-                .handles
-                .get(&account_id)
-                .ok_or_else(|| anyhow::anyhow!("unknown account {account_id}"))?;
-            (
-                handle.account.provider.clone(),
-                handle.account.email.clone(),
-                handle
-                    .refresh_token
-                    .clone()
-                    .ok_or_else(|| anyhow::anyhow!("account {account_id} has no refresh token"))?,
-                handle
-                    .provider
-                    .clone()
-                    .ok_or_else(|| anyhow::anyhow!("account {account_id} has no live provider"))?,
-            )
-        };
+        let (provider_name, email, refresh_token, live_provider) =
+            {
+                let handle = self
+                    .handles
+                    .get(&account_id)
+                    .ok_or_else(|| anyhow::anyhow!("unknown account {account_id}"))?;
+                (
+                    handle.account.provider.clone(),
+                    handle.account.email.clone(),
+                    handle.refresh_token.clone().ok_or_else(|| {
+                        anyhow::anyhow!("account {account_id} has no refresh token")
+                    })?,
+                    handle.provider.clone().ok_or_else(|| {
+                        anyhow::anyhow!("account {account_id} has no live provider")
+                    })?,
+                )
+            };
 
         let fresh = match provider_name.as_str() {
             "gdrive" => {
@@ -382,7 +403,9 @@ impl AccountManager {
                     continue;
                 }
                 let is_more_specific = best
-                    .map(|b| pair.local_path.components().count() > b.local_path.components().count())
+                    .map(|b| {
+                        pair.local_path.components().count() > b.local_path.components().count()
+                    })
                     .unwrap_or(true);
                 if is_more_specific {
                     best = Some(pair);
@@ -391,7 +414,12 @@ impl AccountManager {
         }
         best.and_then(|pair| {
             self.handles.get(&pair.account_id).map(|h| {
-                (pair.id, pair.account_id, h.account.provider.clone(), pair.paused)
+                (
+                    pair.id,
+                    pair.account_id,
+                    h.account.provider.clone(),
+                    pair.paused,
+                )
             })
         })
     }
@@ -418,15 +446,24 @@ impl AccountManager {
         };
 
         rows.into_iter()
-            .filter_map(|(pair_id, relative_path, _conflicting_copy_path, detected_at)| {
-                self.handles.values().find_map(|h| {
-                    h.pairs.iter().find(|p| p.id == pair_id).map(|p| ConflictRecord {
-                        path: p.local_path.join(&relative_path).to_string_lossy().into_owned(),
-                        account_id: p.account_id,
-                        timestamp: detected_at.clone(),
+            .filter_map(
+                |(pair_id, relative_path, _conflicting_copy_path, detected_at)| {
+                    self.handles.values().find_map(|h| {
+                        h.pairs
+                            .iter()
+                            .find(|p| p.id == pair_id)
+                            .map(|p| ConflictRecord {
+                                path: p
+                                    .local_path
+                                    .join(&relative_path)
+                                    .to_string_lossy()
+                                    .into_owned(),
+                                account_id: p.account_id,
+                                timestamp: detected_at.clone(),
+                            })
                     })
-                })
-            })
+                },
+            )
             .collect()
     }
 }
@@ -492,7 +529,11 @@ mod tests {
             Ok((Vec::new(), String::new()))
         }
 
-        async fn upload(&self, _local_path: &Path, _remote_parent_id: &str) -> ProviderResult<RemoteFile> {
+        async fn upload(
+            &self,
+            _local_path: &Path,
+            _remote_parent_id: &str,
+        ) -> ProviderResult<RemoteFile> {
             Err(ProviderError::Other("not used in this test".into()))
         }
 

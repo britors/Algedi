@@ -90,6 +90,10 @@ client_secret = "SEU-CLIENT-SECRET"
 [onedrive]
 client_id = "11111111-2222-3333-4444-555555555555"
 # onedrive não usa client_secret — deixe essa chave de fora.
+
+[scheduler]
+# Opcional; padrão 60 segundos, mínimo efetivo de 15 segundos.
+poll_interval_secs = 60
 ```
 
 Qualquer chave que faltar simplesmente fica indisponível para aquele
@@ -104,6 +108,7 @@ específico. Têm prioridade sobre o `providers.toml`:
 export ALGEDI_GDRIVE_CLIENT_ID="SEU-ID.apps.googleusercontent.com"
 export ALGEDI_GDRIVE_CLIENT_SECRET="SEU-CLIENT-SECRET"
 export ALGEDI_ONEDRIVE_CLIENT_ID="11111111-2222-3333-4444-555555555555"
+export ALGEDI_POLL_INTERVAL_SECS="60"
 ```
 
 ## 4. Testando

@@ -17,6 +17,13 @@ use zbus::object_server::InterfaceRef;
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(60);
 pub const MIN_POLL_INTERVAL: Duration = Duration::from_secs(15);
 
+fn poll_interval(configured_secs: Option<u64>) -> Duration {
+    configured_secs
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_POLL_INTERVAL)
+        .max(MIN_POLL_INTERVAL)
+}
+
 pub async fn run_forever(
     accounts: Arc<Mutex<AccountManager>>,
     conn: zbus::Connection,
@@ -26,8 +33,20 @@ pub async fn run_forever(
         .interface("/org/lyraos/Algedi1")
         .await?;
 
+    let configured_poll_interval = accounts.lock().await.poll_interval_secs();
+    let remote_poll_interval = poll_interval(configured_poll_interval);
+    if configured_poll_interval.is_some_and(|seconds| seconds < MIN_POLL_INTERVAL.as_secs()) {
+        tracing::warn!(
+            configured_secs = configured_poll_interval,
+            minimum_secs = MIN_POLL_INTERVAL.as_secs(),
+            "poll interval raised to provider-safe minimum"
+        );
+    }
+    tracing::info!(
+        poll_interval_secs = remote_poll_interval.as_secs(),
+        "remote polling configured"
+    );
     let mut ticker = tokio::time::interval(Duration::from_millis(100));
-    let remote_poll_interval = DEFAULT_POLL_INTERVAL.max(MIN_POLL_INTERVAL);
     let mut next_remote_poll = Instant::now();
     let mut watchers: HashMap<PairId, FolderWatcher> = HashMap::new();
     loop {
@@ -178,6 +197,14 @@ mod tests {
     use futures_util::StreamExt;
     use std::time::Duration as StdDuration;
     use zbus::{MatchRule, MessageStream};
+
+    #[test]
+    fn polling_uses_default_and_enforces_minimum() {
+        assert_eq!(poll_interval(None), DEFAULT_POLL_INTERVAL);
+        assert_eq!(poll_interval(Some(120)), Duration::from_secs(120));
+        assert_eq!(poll_interval(Some(1)), MIN_POLL_INTERVAL);
+        assert_eq!(poll_interval(Some(0)), MIN_POLL_INTERVAL);
+    }
 
     /// Spins up a real Algedi1 service on the session bus (under a private
     /// test path, no well-known name claimed) and asserts that

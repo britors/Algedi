@@ -24,12 +24,20 @@ struct ProvidersFile {
     gdrive: ProviderCredentials,
     #[serde(default)]
     onedrive: ProviderCredentials,
+    #[serde(default)]
+    scheduler: SchedulerSettings,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct SchedulerSettings {
+    poll_interval_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct ProviderConfig {
     pub gdrive: ProviderCredentials,
     pub onedrive: ProviderCredentials,
+    scheduler: SchedulerSettings,
 }
 
 impl ProviderConfig {
@@ -51,6 +59,14 @@ impl ProviderConfig {
         if let Ok(v) = std::env::var("ALGEDI_ONEDRIVE_CLIENT_ID") {
             config.onedrive.client_id = Some(v);
         }
+        if let Ok(value) = std::env::var("ALGEDI_POLL_INTERVAL_SECS") {
+            match value.parse() {
+                Ok(seconds) => config.scheduler.poll_interval_secs = Some(seconds),
+                Err(error) => {
+                    tracing::warn!(%error, %value, "ignoring invalid ALGEDI_POLL_INTERVAL_SECS")
+                }
+            }
+        }
 
         config
     }
@@ -64,7 +80,15 @@ impl ProviderConfig {
 
     fn parse(toml_contents: &str) -> Self {
         let file: ProvidersFile = toml::from_str(toml_contents).unwrap_or_default();
-        Self { gdrive: file.gdrive, onedrive: file.onedrive }
+        Self {
+            gdrive: file.gdrive,
+            onedrive: file.onedrive,
+            scheduler: file.scheduler,
+        }
+    }
+
+    pub fn poll_interval_secs(&self) -> Option<u64> {
+        self.scheduler.poll_interval_secs
     }
 }
 
@@ -89,16 +113,26 @@ mod tests {
 
             [onedrive]
             client_id = "11111111-2222-3333-4444-555555555555"
+
+            [scheduler]
+            poll_interval_secs = 90
             "#,
         );
 
-        assert_eq!(config.gdrive.client_id.as_deref(), Some("gdrive-id.apps.googleusercontent.com"));
-        assert_eq!(config.gdrive.client_secret.as_deref(), Some("gdrive-secret"));
+        assert_eq!(
+            config.gdrive.client_id.as_deref(),
+            Some("gdrive-id.apps.googleusercontent.com")
+        );
+        assert_eq!(
+            config.gdrive.client_secret.as_deref(),
+            Some("gdrive-secret")
+        );
         assert_eq!(
             config.onedrive.client_id.as_deref(),
             Some("11111111-2222-3333-4444-555555555555")
         );
         assert_eq!(config.onedrive.client_secret, None);
+        assert_eq!(config.poll_interval_secs(), Some(90));
     }
 
     #[test]
