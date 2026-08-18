@@ -114,7 +114,11 @@ impl StateDb {
         Ok(())
     }
 
-    pub fn file_status(&self, pair_id: PairId, relative_path: &str) -> rusqlite::Result<SyncStatus> {
+    pub fn file_status(
+        &self,
+        pair_id: PairId,
+        relative_path: &str,
+    ) -> rusqlite::Result<SyncStatus> {
         let status: Option<String> = self
             .conn
             .query_row(
@@ -152,6 +156,23 @@ impl StateDb {
         }
     }
 
+    pub fn relative_path_for_remote_id(
+        &self,
+        pair_id: PairId,
+        remote_id: &str,
+    ) -> rusqlite::Result<Option<String>> {
+        let result = self.conn.query_row(
+            "SELECT relative_path FROM files WHERE pair_id = ?1 AND remote_id = ?2",
+            params![pair_id.to_string(), remote_id],
+            |row| row.get(0),
+        );
+        match result {
+            Ok(path) => Ok(Some(path)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Records the given hashes for `relative_path` under `status` (one of
     /// the `SyncStatus::as_str()` values). Used directly when the status
     /// isn't plain `"synced"` — e.g. `apply_conflict` marks the
@@ -174,7 +195,14 @@ impl StateDb {
                 local_hash = excluded.local_hash,
                 remote_hash = excluded.remote_hash,
                 status = excluded.status",
-            params![pair_id.to_string(), relative_path, remote_id, local_hash, remote_hash, status],
+            params![
+                pair_id.to_string(),
+                relative_path,
+                remote_id,
+                local_hash,
+                remote_hash,
+                status
+            ],
         )?;
         Ok(())
     }
@@ -189,7 +217,14 @@ impl StateDb {
         local_hash: Option<&str>,
         remote_hash: Option<&str>,
     ) -> rusqlite::Result<()> {
-        self.record_file_state(pair_id, relative_path, remote_id, local_hash, remote_hash, "synced")
+        self.record_file_state(
+            pair_id,
+            relative_path,
+            remote_id,
+            local_hash,
+            remote_hash,
+            "synced",
+        )
     }
 
     pub fn remove_file_record(&self, pair_id: PairId, relative_path: &str) -> rusqlite::Result<()> {
@@ -283,6 +318,35 @@ mod tests {
         assert_eq!(db.get_change_cursor(pair.id).unwrap(), None);
 
         db.set_change_cursor(pair.id, "token-1").unwrap();
-        assert_eq!(db.get_change_cursor(pair.id).unwrap(), Some("token-1".into()));
+        assert_eq!(
+            db.get_change_cursor(pair.id).unwrap(),
+            Some("token-1".into())
+        );
+    }
+
+    #[test]
+    fn resolves_a_synced_path_by_remote_id() {
+        let db = StateDb::open_in_memory().unwrap();
+        let pair = FolderPair {
+            id: uuid::Uuid::new_v4(),
+            account_id: uuid::Uuid::new_v4(),
+            local_path: "/tmp/local".into(),
+            remote_path: "/remote".into(),
+            remote_folder_id: "root".into(),
+            paused: false,
+        };
+        db.insert_folder_pair(&pair).unwrap();
+        db.record_synced(pair.id, "nested/file.txt", Some("remote-123"), None, None)
+            .unwrap();
+        assert_eq!(
+            db.relative_path_for_remote_id(pair.id, "remote-123")
+                .unwrap()
+                .as_deref(),
+            Some("nested/file.txt")
+        );
+        assert_eq!(
+            db.relative_path_for_remote_id(pair.id, "missing").unwrap(),
+            None
+        );
     }
 }

@@ -7,7 +7,7 @@ use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 
-const GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0";
+pub(crate) const GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0";
 const SIMPLE_UPLOAD_LIMIT: u64 = 4 * 1024 * 1024;
 const UPLOAD_CHUNK_SIZE: usize = 10 * 320 * 1024;
 
@@ -31,6 +31,8 @@ pub struct DriveItem {
     pub file: Option<FileFacet>,
     #[serde(default, rename = "parentReference")]
     pub parent_reference: Option<ParentReference>,
+    #[serde(default)]
+    pub deleted: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -192,7 +194,7 @@ impl GraphApi {
         }
     }
 
-    async fn get_json<T: for<'de> Deserialize<'de>>(
+    pub(crate) async fn get_json<T: for<'de> Deserialize<'de>>(
         &self,
         url: &str,
     ) -> algedi_provider_trait::ProviderResult<T> {

@@ -11,10 +11,21 @@ use std::sync::{Arc, Mutex};
 /// snapshot (`RemoteFile`) needed to actually apply the action.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SyncAction {
-    Upload { relative_path: String, remote: RemoteFile },
-    Download { relative_path: String, remote: RemoteFile },
-    Conflict { relative_path: String, remote: RemoteFile },
-    DeleteLocal { relative_path: String },
+    Upload {
+        relative_path: String,
+        remote: RemoteFile,
+    },
+    Download {
+        relative_path: String,
+        remote: RemoteFile,
+    },
+    Conflict {
+        relative_path: String,
+        remote: RemoteFile,
+    },
+    DeleteLocal {
+        relative_path: String,
+    },
     NoOp,
 }
 
@@ -43,8 +54,16 @@ pub struct SyncEngine {
 }
 
 impl SyncEngine {
-    pub fn new(pair: FolderPair, provider: Arc<dyn CloudProvider>, state: Arc<Mutex<StateDb>>) -> Self {
-        Self { pair, provider, state }
+    pub fn new(
+        pair: FolderPair,
+        provider: Arc<dyn CloudProvider>,
+        state: Arc<Mutex<StateDb>>,
+    ) -> Self {
+        Self {
+            pair,
+            provider,
+            state,
+        }
     }
 
     /// One full reconciliation cycle: pull remote changes, then decide an
@@ -60,11 +79,26 @@ impl SyncEngine {
 
         let cursor = self.state.lock().unwrap().get_change_cursor(self.pair.id)?;
         let (remote_changes, new_cursor) = self.provider.list_changes(cursor.as_ref()).await?;
-        self.state.lock().unwrap().set_change_cursor(self.pair.id, &new_cursor)?;
+        self.state
+            .lock()
+            .unwrap()
+            .set_change_cursor(self.pair.id, &new_cursor)?;
 
         let mut actions = Vec::with_capacity(remote_changes.len());
         for change in &remote_changes {
-            actions.push(self.classify(change)?);
+            let mut change = change.clone();
+            if matches!(change.kind, ChangeKind::Deleted) && change.file.name.is_empty() {
+                let known_path = self
+                    .state
+                    .lock()
+                    .unwrap()
+                    .relative_path_for_remote_id(self.pair.id, &change.file.remote_id)?;
+                let Some(known_path) = known_path else {
+                    continue;
+                };
+                change.file.name = known_path;
+            }
+            actions.push(self.classify(&change)?);
         }
         Ok(actions)
     }
@@ -81,15 +115,21 @@ impl SyncEngine {
         let relative_path = change.file.name.clone();
         let local_path = self.pair.local_path.join(&relative_path);
 
-        let (known_local_hash, known_remote_hash) =
-            self.state.lock().unwrap().get_hashes(self.pair.id, &relative_path)?;
+        let (known_local_hash, known_remote_hash) = self
+            .state
+            .lock()
+            .unwrap()
+            .get_hashes(self.pair.id, &relative_path)?;
 
         let current_local_hash = crate::hash_file(&local_path).ok();
         let local_changed = current_local_hash != known_local_hash;
 
         if matches!(change.kind, ChangeKind::Deleted) {
             return Ok(if local_changed {
-                SyncAction::Conflict { relative_path, remote: change.file.clone() }
+                SyncAction::Conflict {
+                    relative_path,
+                    remote: change.file.clone(),
+                }
             } else {
                 SyncAction::DeleteLocal { relative_path }
             });
@@ -99,9 +139,18 @@ impl SyncEngine {
         let remote_changed = current_remote_hash != known_remote_hash;
 
         Ok(match (remote_changed, local_changed) {
-            (true, true) => SyncAction::Conflict { relative_path, remote: change.file.clone() },
-            (true, false) => SyncAction::Download { relative_path, remote: change.file.clone() },
-            (false, true) => SyncAction::Upload { relative_path, remote: change.file.clone() },
+            (true, true) => SyncAction::Conflict {
+                relative_path,
+                remote: change.file.clone(),
+            },
+            (true, false) => SyncAction::Download {
+                relative_path,
+                remote: change.file.clone(),
+            },
+            (false, true) => SyncAction::Upload {
+                relative_path,
+                remote: change.file.clone(),
+            },
             (false, false) => SyncAction::NoOp,
         })
     }
@@ -111,30 +160,48 @@ impl SyncEngine {
     /// updates `StateDb` so the next cycle sees the new synced state.
     pub async fn apply(&mut self, action: &SyncAction) -> anyhow::Result<()> {
         match action {
-            SyncAction::Download { relative_path, remote } => self.apply_download(relative_path, remote).await,
-            SyncAction::Upload { relative_path, remote } => self.apply_upload(relative_path, remote).await,
-            SyncAction::Conflict { relative_path, remote } => self.apply_conflict(relative_path, remote).await,
+            SyncAction::Download {
+                relative_path,
+                remote,
+            } => self.apply_download(relative_path, remote).await,
+            SyncAction::Upload {
+                relative_path,
+                remote,
+            } => self.apply_upload(relative_path, remote).await,
+            SyncAction::Conflict {
+                relative_path,
+                remote,
+            } => self.apply_conflict(relative_path, remote).await,
             SyncAction::DeleteLocal { relative_path } => self.apply_delete_local(relative_path),
             SyncAction::NoOp => Ok(()),
         }
     }
 
-    async fn apply_download(&mut self, relative_path: &str, remote: &RemoteFile) -> anyhow::Result<()> {
+    async fn apply_download(
+        &mut self,
+        relative_path: &str,
+        remote: &RemoteFile,
+    ) -> anyhow::Result<()> {
         let local_path = self.pair.local_path.join(relative_path);
 
         if remote.is_folder {
             std::fs::create_dir_all(&local_path)?;
-            self.state
-                .lock()
-                .unwrap()
-                .record_synced(self.pair.id, relative_path, Some(&remote.remote_id), None, None)?;
+            self.state.lock().unwrap().record_synced(
+                self.pair.id,
+                relative_path,
+                Some(&remote.remote_id),
+                None,
+                None,
+            )?;
             return Ok(());
         }
 
         if let Some(parent) = local_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        self.provider.download(&remote.remote_id, &local_path).await?;
+        self.provider
+            .download(&remote.remote_id, &local_path)
+            .await?;
         let local_hash = crate::hash_file(&local_path)?;
         self.state.lock().unwrap().record_synced(
             self.pair.id,
@@ -146,7 +213,11 @@ impl SyncEngine {
         Ok(())
     }
 
-    async fn apply_upload(&mut self, relative_path: &str, remote: &RemoteFile) -> anyhow::Result<()> {
+    async fn apply_upload(
+        &mut self,
+        relative_path: &str,
+        remote: &RemoteFile,
+    ) -> anyhow::Result<()> {
         if remote.is_folder {
             anyhow::bail!("uploading folder changes is not supported yet: {relative_path}");
         }
@@ -156,7 +227,10 @@ impl SyncEngine {
         // should use `remote.remote_id` to update the existing file's
         // content in place once the trait grows that capability, instead
         // of creating a duplicate.
-        let uploaded = self.provider.upload(&local_path, &self.pair.remote_folder_id).await?;
+        let uploaded = self
+            .provider
+            .upload(&local_path, &self.pair.remote_folder_id)
+            .await?;
         let local_hash = crate::hash_file(&local_path)?;
         self.state.lock().unwrap().record_synced(
             self.pair.id,
@@ -168,7 +242,11 @@ impl SyncEngine {
         Ok(())
     }
 
-    async fn apply_conflict(&mut self, relative_path: &str, remote: &RemoteFile) -> anyhow::Result<()> {
+    async fn apply_conflict(
+        &mut self,
+        relative_path: &str,
+        remote: &RemoteFile,
+    ) -> anyhow::Result<()> {
         if remote.is_folder {
             anyhow::bail!("folder conflicts are not handled yet: {relative_path}");
         }
@@ -182,18 +260,22 @@ impl SyncEngine {
             let hostname = hostname::get()
                 .map(|h| h.to_string_lossy().into_owned())
                 .unwrap_or_else(|_| "desconhecido".into());
-            let conflict_path = crate::conflicting_file_name(&local_path, &hostname, chrono::Local::now());
+            let conflict_path =
+                crate::conflicting_file_name(&local_path, &hostname, chrono::Local::now());
             std::fs::rename(&local_path, &conflict_path)?;
-            self.state
-                .lock()
-                .unwrap()
-                .record_conflict(self.pair.id, relative_path, &conflict_path)?;
+            self.state.lock().unwrap().record_conflict(
+                self.pair.id,
+                relative_path,
+                &conflict_path,
+            )?;
         }
 
         if let Some(parent) = local_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        self.provider.download(&remote.remote_id, &local_path).await?;
+        self.provider
+            .download(&remote.remote_id, &local_path)
+            .await?;
         let local_hash = crate::hash_file(&local_path)?;
         // Marked "conflict", not "synced": the path now holds the remote
         // version, but the auto-generated copy still needs the user's
@@ -214,7 +296,10 @@ impl SyncEngine {
         if local_path.exists() {
             std::fs::remove_file(&local_path)?;
         }
-        self.state.lock().unwrap().remove_file_record(self.pair.id, relative_path)?;
+        self.state
+            .lock()
+            .unwrap()
+            .remove_file_record(self.pair.id, relative_path)?;
         Ok(())
     }
 
@@ -246,11 +331,17 @@ mod tests {
 
     impl FakeProvider {
         fn new(changes: Vec<RemoteChange>) -> Self {
-            Self { changes, contents: Mutex::new(HashMap::new()) }
+            Self {
+                changes,
+                contents: Mutex::new(HashMap::new()),
+            }
         }
 
         fn with_content(self, remote_id: &str, bytes: &[u8]) -> Self {
-            self.contents.lock().unwrap().insert(remote_id.to_string(), bytes.to_vec());
+            self.contents
+                .lock()
+                .unwrap()
+                .insert(remote_id.to_string(), bytes.to_vec());
             self
         }
     }
@@ -268,10 +359,19 @@ mod tests {
             Ok((self.changes.clone(), "cursor-1".into()))
         }
 
-        async fn upload(&self, local_path: &Path, remote_parent_id: &str) -> ProviderResult<RemoteFile> {
-            let hash = crate::hash_file(local_path).map_err(|e| ProviderError::Other(e.to_string()))?;
+        async fn upload(
+            &self,
+            local_path: &Path,
+            remote_parent_id: &str,
+        ) -> ProviderResult<RemoteFile> {
+            let hash =
+                crate::hash_file(local_path).map_err(|e| ProviderError::Other(e.to_string()))?;
             let size = std::fs::metadata(local_path).map(|m| m.len()).unwrap_or(0);
-            let name = local_path.file_name().unwrap().to_string_lossy().into_owned();
+            let name = local_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
             Ok(RemoteFile {
                 remote_id: format!("uploaded-{name}"),
                 name,
@@ -284,7 +384,13 @@ mod tests {
         }
 
         async fn download(&self, remote_id: &str, dest_path: &Path) -> ProviderResult<()> {
-            let bytes = self.contents.lock().unwrap().get(remote_id).cloned().unwrap_or_default();
+            let bytes = self
+                .contents
+                .lock()
+                .unwrap()
+                .get(remote_id)
+                .cloned()
+                .unwrap_or_default();
             std::fs::write(dest_path, bytes).map_err(|e| ProviderError::Other(e.to_string()))
         }
 
@@ -336,7 +442,13 @@ mod tests {
         state.insert_folder_pair(&pair).unwrap();
         let local_hash = crate::hash_file(&dir.path().join("notes.txt")).unwrap();
         state
-            .record_synced(pair.id, "notes.txt", None, Some(&local_hash), Some("old-remote-hash"))
+            .record_synced(
+                pair.id,
+                "notes.txt",
+                None,
+                Some(&local_hash),
+                Some("old-remote-hash"),
+            )
             .unwrap();
 
         let file = remote_file("notes.txt", "new-remote-hash");
@@ -350,7 +462,10 @@ mod tests {
 
         assert_eq!(
             actions,
-            vec![SyncAction::Download { relative_path: "notes.txt".into(), remote: file }]
+            vec![SyncAction::Download {
+                relative_path: "notes.txt".into(),
+                remote: file
+            }]
         );
     }
 
@@ -363,7 +478,13 @@ mod tests {
         let pair = test_pair(dir.path().to_path_buf());
         state.insert_folder_pair(&pair).unwrap();
         state
-            .record_synced(pair.id, "notes.txt", None, Some("old-local-hash"), Some("old-remote-hash"))
+            .record_synced(
+                pair.id,
+                "notes.txt",
+                None,
+                Some("old-local-hash"),
+                Some("old-remote-hash"),
+            )
             .unwrap();
 
         let file = remote_file("notes.txt", "new-remote-hash");
@@ -377,7 +498,10 @@ mod tests {
 
         assert_eq!(
             actions,
-            vec![SyncAction::Conflict { relative_path: "notes.txt".into(), remote: file }]
+            vec![SyncAction::Conflict {
+                relative_path: "notes.txt".into(),
+                remote: file
+            }]
         );
     }
 
@@ -391,7 +515,13 @@ mod tests {
         state.insert_folder_pair(&pair).unwrap();
         let local_hash = crate::hash_file(&dir.path().join("notes.txt")).unwrap();
         state
-            .record_synced(pair.id, "notes.txt", None, Some(&local_hash), Some("stable-remote-hash"))
+            .record_synced(
+                pair.id,
+                "notes.txt",
+                None,
+                Some(&local_hash),
+                Some("stable-remote-hash"),
+            )
             .unwrap();
 
         let provider = Arc::new(FakeProvider::new(vec![RemoteChange {
@@ -415,7 +545,13 @@ mod tests {
         state.insert_folder_pair(&pair).unwrap();
         let local_hash = crate::hash_file(&dir.path().join("notes.txt")).unwrap();
         state
-            .record_synced(pair.id, "notes.txt", None, Some(&local_hash), Some("old-remote-hash"))
+            .record_synced(
+                pair.id,
+                "notes.txt",
+                None,
+                Some(&local_hash),
+                Some("old-remote-hash"),
+            )
             .unwrap();
 
         let provider = Arc::new(FakeProvider::new(vec![RemoteChange {
@@ -428,7 +564,9 @@ mod tests {
 
         assert_eq!(
             actions,
-            vec![SyncAction::DeleteLocal { relative_path: "notes.txt".into() }]
+            vec![SyncAction::DeleteLocal {
+                relative_path: "notes.txt".into()
+            }]
         );
     }
 
@@ -458,8 +596,11 @@ mod tests {
 
         let file = remote_file("notes.txt", "remote-hash-1");
         let provider = Arc::new(
-            FakeProvider::new(vec![RemoteChange { file: file.clone(), kind: ChangeKind::Modified }])
-                .with_content(&file.remote_id, b"downloaded content"),
+            FakeProvider::new(vec![RemoteChange {
+                file: file.clone(),
+                kind: ChangeKind::Modified,
+            }])
+            .with_content(&file.remote_id, b"downloaded content"),
         );
 
         let mut engine = SyncEngine::new(pair, provider, state.clone());
@@ -492,13 +633,22 @@ mod tests {
         state
             .lock()
             .unwrap()
-            .record_synced(pair.id, "notes.txt", None, Some("old-local-hash"), Some("old-remote-hash"))
+            .record_synced(
+                pair.id,
+                "notes.txt",
+                None,
+                Some("old-local-hash"),
+                Some("old-remote-hash"),
+            )
             .unwrap();
 
         let file = remote_file("notes.txt", "new-remote-hash");
         let provider = Arc::new(
-            FakeProvider::new(vec![RemoteChange { file: file.clone(), kind: ChangeKind::Modified }])
-                .with_content(&file.remote_id, b"the remote version"),
+            FakeProvider::new(vec![RemoteChange {
+                file: file.clone(),
+                kind: ChangeKind::Modified,
+            }])
+            .with_content(&file.remote_id, b"the remote version"),
         );
 
         let mut engine = SyncEngine::new(pair.clone(), provider, state.clone());
@@ -545,7 +695,13 @@ mod tests {
         state
             .lock()
             .unwrap()
-            .record_synced(pair.id, "notes.txt", None, Some(&local_hash), Some("old-remote-hash"))
+            .record_synced(
+                pair.id,
+                "notes.txt",
+                None,
+                Some(&local_hash),
+                Some("old-remote-hash"),
+            )
             .unwrap();
 
         let provider = Arc::new(FakeProvider::new(vec![RemoteChange {
@@ -561,7 +717,11 @@ mod tests {
 
         assert!(!dir.path().join("notes.txt").exists());
         assert_eq!(
-            state.lock().unwrap().get_hashes(pair.id, "notes.txt").unwrap(),
+            state
+                .lock()
+                .unwrap()
+                .get_hashes(pair.id, "notes.txt")
+                .unwrap(),
             (None, None)
         );
     }

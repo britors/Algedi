@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 use tokio_util::io::ReaderStream;
 
-const API_BASE: &str = "https://www.googleapis.com/drive/v3";
+pub(crate) const API_BASE: &str = "https://www.googleapis.com/drive/v3";
 const UPLOAD_BASE: &str = "https://www.googleapis.com/upload/drive/v3";
 const FIELDS: &str = "id,name,mimeType,md5Checksum,size,modifiedTime,parents";
 
@@ -173,7 +173,7 @@ impl GDriveApi {
         }
     }
 
-    async fn get_json<T: for<'de> Deserialize<'de>>(
+    pub(crate) async fn get_json<T: for<'de> Deserialize<'de>>(
         &self,
         url: &str,
     ) -> algedi_provider_trait::ProviderResult<T> {
