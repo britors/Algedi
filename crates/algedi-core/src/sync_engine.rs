@@ -148,6 +148,20 @@ impl SyncEngine {
             });
         }
 
+        if change.file.is_folder {
+            return Ok(if !local_path.exists() || local_path.is_dir() {
+                SyncAction::Download {
+                    relative_path,
+                    remote: change.file.clone(),
+                }
+            } else {
+                SyncAction::Conflict {
+                    relative_path,
+                    remote: change.file.clone(),
+                }
+            });
+        }
+
         let current_remote_hash = change.file.content_hash.clone();
         let remote_changed = current_remote_hash != known_remote_hash;
 
@@ -231,19 +245,41 @@ impl SyncEngine {
         relative_path: &str,
         remote: &RemoteFile,
     ) -> anyhow::Result<()> {
-        if remote.is_folder {
-            anyhow::bail!("uploading folder changes is not supported yet: {relative_path}");
-        }
-
         let local_path = self.pair.local_path.join(relative_path);
+        let remote_parent_id = remote
+            .parent_id
+            .as_deref()
+            .unwrap_or(&self.pair.remote_folder_id);
+        if remote.is_folder {
+            anyhow::ensure!(
+                local_path.is_dir(),
+                "local folder does not exist: {relative_path}"
+            );
+            let folder = if remote.remote_id.is_empty() {
+                let name = local_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("folder has no valid UTF-8 name: {relative_path}")
+                    })?;
+                self.provider.create_folder(name, remote_parent_id).await?
+            } else {
+                remote.clone()
+            };
+            self.state.lock().unwrap().record_synced(
+                self.pair.id,
+                relative_path,
+                Some(&folder.remote_id),
+                None,
+                None,
+            )?;
+            return Ok(());
+        }
         // NOTE: CloudProvider::upload is create-shaped. A real adapter
         // should use `remote.remote_id` to update the existing file's
         // content in place once the trait grows that capability, instead
         // of creating a duplicate.
-        let uploaded = self
-            .provider
-            .upload(&local_path, &self.pair.remote_folder_id)
-            .await?;
+        let uploaded = self.provider.upload(&local_path, remote_parent_id).await?;
         let local_hash = crate::hash_file(&local_path)?;
         self.state.lock().unwrap().record_synced(
             self.pair.id,
@@ -260,11 +296,35 @@ impl SyncEngine {
         relative_path: &str,
         remote: &RemoteFile,
     ) -> anyhow::Result<()> {
-        if remote.is_folder {
-            anyhow::bail!("folder conflicts are not handled yet: {relative_path}");
-        }
-
         let local_path = self.pair.local_path.join(relative_path);
+
+        if remote.is_folder {
+            let mut conflicted = false;
+            if local_path.exists() && !local_path.is_dir() {
+                let hostname = hostname::get()
+                    .map(|h| h.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| "desconhecido".into());
+                let conflict_path =
+                    crate::conflicting_file_name(&local_path, &hostname, chrono::Local::now());
+                std::fs::rename(&local_path, &conflict_path)?;
+                self.state.lock().unwrap().record_conflict(
+                    self.pair.id,
+                    relative_path,
+                    &conflict_path,
+                )?;
+                conflicted = true;
+            }
+            std::fs::create_dir_all(&local_path)?;
+            self.state.lock().unwrap().record_file_state(
+                self.pair.id,
+                relative_path,
+                Some(&remote.remote_id),
+                None,
+                None,
+                if conflicted { "conflict" } else { "synced" },
+            )?;
+            return Ok(());
+        }
 
         // Never overwrite silently (PROMPT-ALGEDI.md sec. 5.3): keep the
         // local edit under a distinct name, then let the original path
@@ -307,7 +367,11 @@ impl SyncEngine {
     fn apply_delete_local(&mut self, relative_path: &str) -> anyhow::Result<()> {
         let local_path = self.pair.local_path.join(relative_path);
         if local_path.exists() {
-            std::fs::remove_file(&local_path)?;
+            if local_path.is_dir() {
+                std::fs::remove_dir(&local_path)?;
+            } else {
+                std::fs::remove_file(&local_path)?;
+            }
         }
         self.state
             .lock()
@@ -341,6 +405,7 @@ mod tests {
         /// remote_id -> bytes served by `download`.
         contents: Mutex<HashMap<String, Vec<u8>>>,
         metadata: HashMap<String, RemoteFile>,
+        created_folders: Mutex<Vec<(String, String)>>,
     }
 
     impl FakeProvider {
@@ -349,6 +414,7 @@ mod tests {
                 changes,
                 contents: Mutex::new(HashMap::new()),
                 metadata: HashMap::new(),
+                created_folders: Mutex::new(Vec::new()),
             }
         }
 
@@ -412,6 +478,22 @@ mod tests {
                 .cloned()
                 .unwrap_or_default();
             std::fs::write(dest_path, bytes).map_err(|e| ProviderError::Other(e.to_string()))
+        }
+
+        async fn create_folder(
+            &self,
+            name: &str,
+            remote_parent_id: &str,
+        ) -> ProviderResult<RemoteFile> {
+            self.created_folders
+                .lock()
+                .unwrap()
+                .push((name.into(), remote_parent_id.into()));
+            Ok(remote_folder(
+                &format!("created-{name}"),
+                name,
+                remote_parent_id,
+            ))
         }
 
         async fn delete(&self, _remote_id: &str) -> ProviderResult<()> {
@@ -808,5 +890,76 @@ mod tests {
         );
         let mut engine = SyncEngine::new(pair, provider, Arc::new(Mutex::new(state)));
         assert!(engine.run_cycle().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn uploads_a_local_folder_to_its_remote_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("Projects")).unwrap();
+        let state = Arc::new(Mutex::new(StateDb::open_in_memory().unwrap()));
+        let pair = test_pair(dir.path().to_path_buf());
+        state.lock().unwrap().insert_folder_pair(&pair).unwrap();
+        let provider = Arc::new(FakeProvider::new(Vec::new()));
+        let remote = remote_folder("", "Projects", "parent-42");
+        let mut engine = SyncEngine::new(pair.clone(), provider.clone(), state.clone());
+        engine
+            .apply(&SyncAction::Upload {
+                relative_path: "Projects".into(),
+                remote,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            *provider.created_folders.lock().unwrap(),
+            vec![("Projects".into(), "parent-42".into())]
+        );
+        assert_eq!(
+            state
+                .lock()
+                .unwrap()
+                .file_status(pair.id, "Projects")
+                .unwrap(),
+            SyncStatus::Synced
+        );
+    }
+
+    #[tokio::test]
+    async fn folder_conflict_preserves_local_file_and_creates_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Projects"), b"local file").unwrap();
+        let state = Arc::new(Mutex::new(StateDb::open_in_memory().unwrap()));
+        let pair = test_pair(dir.path().to_path_buf());
+        state.lock().unwrap().insert_folder_pair(&pair).unwrap();
+        let provider = Arc::new(FakeProvider::new(Vec::new()));
+        let remote = remote_folder("folder-id", "Projects", "root");
+        let mut engine = SyncEngine::new(pair.clone(), provider, state.clone());
+        engine
+            .apply(&SyncAction::Conflict {
+                relative_path: "Projects".into(),
+                remote,
+            })
+            .await
+            .unwrap();
+        assert!(dir.path().join("Projects").is_dir());
+        let preserved: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("Projects (conflito de")
+            })
+            .collect();
+        assert_eq!(preserved.len(), 1);
+        assert_eq!(std::fs::read(preserved[0].path()).unwrap(), b"local file");
+        assert_eq!(
+            state
+                .lock()
+                .unwrap()
+                .file_status(pair.id, "Projects")
+                .unwrap(),
+            SyncStatus::Conflict
+        );
     }
 }

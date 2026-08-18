@@ -151,6 +151,22 @@ impl GraphApi {
         }
     }
 
+    pub async fn create_folder(&self, name: &str, parent_id: &str) -> ProviderResult<DriveItem> {
+        let response = self
+            .http
+            .post(format!("{GRAPH_BASE}/me/drive/items/{parent_id}/children"))
+            .bearer_auth(self.access_token())
+            .json(&serde_json::json!({
+                "name": name,
+                "folder": {},
+                "@microsoft.graph.conflictBehavior": "rename"
+            }))
+            .send()
+            .await
+            .map_err(network_error)?;
+        decode_json(response, name).await
+    }
+
     pub async fn download_item(&self, item_id: &str, dest_path: &Path) -> ProviderResult<()> {
         let mut response = self
             .http

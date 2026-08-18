@@ -71,6 +71,17 @@ pub trait CloudProvider: Send + Sync {
     async fn upload(&self, local_path: &Path, remote_parent_id: &str)
         -> ProviderResult<RemoteFile>;
 
+    async fn create_folder(
+        &self,
+        name: &str,
+        remote_parent_id: &str,
+    ) -> ProviderResult<RemoteFile> {
+        let _ = (name, remote_parent_id);
+        Err(ProviderError::Other(
+            "folder creation is not supported by this provider".into(),
+        ))
+    }
+
     async fn download(&self, remote_id: &str, dest_path: &Path) -> ProviderResult<()>;
 
     async fn delete(&self, remote_id: &str) -> ProviderResult<()>;

@@ -72,6 +72,15 @@ impl CloudProvider for OneDriveProvider {
         Ok(to_remote_file(item))
     }
 
+    async fn create_folder(
+        &self,
+        name: &str,
+        remote_parent_id: &str,
+    ) -> ProviderResult<RemoteFile> {
+        let folder = self.api.create_folder(name, remote_parent_id).await?;
+        Ok(to_remote_file(folder))
+    }
+
     async fn download(&self, remote_id: &str, dest_path: &Path) -> ProviderResult<()> {
         self.api.download_item(remote_id, dest_path).await
     }
