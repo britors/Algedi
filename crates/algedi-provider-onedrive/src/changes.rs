@@ -99,6 +99,11 @@ impl CloudProvider for OneDriveProvider {
         Ok(to_remote_file(item))
     }
 
+    async fn resolve_folder(&self, remote_path: &str) -> ProviderResult<RemoteFile> {
+        let folder = self.api.resolve_folder_path(remote_path).await?;
+        Ok(to_remote_file(folder))
+    }
+
     fn web_url(&self, remote_id: &str) -> String {
         format!("https://onedrive.live.com/?id={remote_id}")
     }

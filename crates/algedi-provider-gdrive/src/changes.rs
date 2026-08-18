@@ -121,6 +121,11 @@ impl CloudProvider for GDriveProvider {
         Ok(to_remote_file(file))
     }
 
+    async fn resolve_folder(&self, remote_path: &str) -> ProviderResult<RemoteFile> {
+        let folder = self.api.resolve_folder_path(remote_path).await?;
+        Ok(to_remote_file(folder))
+    }
+
     fn web_url(&self, remote_id: &str) -> String {
         format!("https://drive.google.com/file/d/{remote_id}/view")
     }

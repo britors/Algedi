@@ -28,6 +28,14 @@ pub struct DriveFile {
     pub parents: Vec<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DriveFileList {
+    #[serde(default)]
+    files: Vec<DriveFile>,
+    next_page_token: Option<String>,
+}
+
 pub struct GDriveApi {
     http: reqwest::Client,
     // RwLock, not a plain field: `CloudProvider::set_access_token` takes
@@ -60,6 +68,47 @@ impl GDriveApi {
             "{API_BASE}/files/{file_id}?fields=id,name,mimeType,md5Checksum,size,modifiedTime,parents"
         );
         self.get_json(&url).await
+    }
+
+    pub async fn resolve_folder_path(&self, remote_path: &str) -> ProviderResult<DriveFile> {
+        let components = remote_path_components(remote_path)?;
+        let mut folder = self.get_file("root").await?;
+        for name in components {
+            let escaped = name.replace('\\', "\\\\").replace('\'', "\\'");
+            let query = format!(
+                "name = '{escaped}' and '{}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
+                folder.id
+            );
+            let mut matches = Vec::new();
+            let mut page_token: Option<String> = None;
+            loop {
+                let mut url = reqwest::Url::parse(&format!("{API_BASE}/files"))
+                    .map_err(|error| ProviderError::Other(error.to_string()))?;
+                url.query_pairs_mut()
+                    .append_pair("q", &query)
+                    .append_pair("spaces", "drive")
+                    .append_pair("fields", &format!("nextPageToken,files({FIELDS})"));
+                if let Some(token) = &page_token {
+                    url.query_pairs_mut().append_pair("pageToken", token);
+                }
+                let page: DriveFileList = self.get_json(url.as_str()).await?;
+                matches.extend(page.files);
+                match page.next_page_token {
+                    Some(token) => page_token = Some(token),
+                    None => break,
+                }
+            }
+            folder = match matches.len() {
+                0 => return Err(ProviderError::NotFound(remote_path.into())),
+                1 => matches.pop().unwrap(),
+                count => {
+                    return Err(ProviderError::Other(format!(
+                        "remote path is ambiguous: {remote_path:?} matched {count} folders"
+                    )))
+                }
+            };
+        }
+        Ok(folder)
     }
 
     pub async fn create_folder(&self, name: &str, parent_id: &str) -> ProviderResult<DriveFile> {
@@ -256,6 +305,19 @@ fn temporary_path(dest: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+fn remote_path_components(remote_path: &str) -> ProviderResult<Vec<&str>> {
+    let components: Vec<_> = remote_path
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    if components.iter().any(|part| matches!(*part, "." | "..")) {
+        return Err(ProviderError::Other(format!(
+            "unsafe remote folder path: {remote_path:?}"
+        )));
+    }
+    Ok(components)
+}
+
 fn network_error(error: reqwest::Error) -> ProviderError {
     ProviderError::Network(error.to_string())
 }
@@ -310,5 +372,14 @@ mod tests {
             temporary_path(Path::new("/tmp/report.pdf")),
             PathBuf::from("/tmp/report.pdf.algedi-part")
         );
+    }
+
+    #[test]
+    fn validates_remote_folder_path_components() {
+        assert_eq!(
+            remote_path_components("/Work/2026/").unwrap(),
+            vec!["Work", "2026"]
+        );
+        assert!(remote_path_components("/Work/../Secrets").is_err());
     }
 }

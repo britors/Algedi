@@ -95,6 +95,13 @@ pub trait CloudProvider: Send + Sync {
 
     async fn get_metadata(&self, remote_id: &str) -> ProviderResult<RemoteFile>;
 
+    async fn resolve_folder(&self, remote_path: &str) -> ProviderResult<RemoteFile> {
+        let _ = remote_path;
+        Err(ProviderError::Other(
+            "folder path resolution is not supported by this provider".into(),
+        ))
+    }
+
     /// Resolves `file` to a safe path below `root_id` by walking its parent
     /// chain. `None` means the item is outside this synchronized root.
     async fn resolve_relative_path(

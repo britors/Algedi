@@ -84,6 +84,27 @@ impl GraphApi {
         self.get_json(&url).await
     }
 
+    pub async fn resolve_folder_path(&self, remote_path: &str) -> ProviderResult<DriveItem> {
+        let components = remote_path_components(remote_path)?;
+        let url = if components.is_empty() {
+            format!("{GRAPH_BASE}/me/drive/root")
+        } else {
+            let encoded = components
+                .into_iter()
+                .map(|part| utf8_percent_encode(part, NON_ALPHANUMERIC).to_string())
+                .collect::<Vec<_>>()
+                .join("/");
+            format!("{GRAPH_BASE}/me/drive/root:/{encoded}")
+        };
+        let item: DriveItem = self.get_json(&url).await?;
+        if item.folder.is_none() {
+            return Err(ProviderError::Other(format!(
+                "remote path is not a folder: {remote_path:?}"
+            )));
+        }
+        Ok(item)
+    }
+
     pub async fn upload_item(
         &self,
         local_path: &Path,
@@ -309,6 +330,19 @@ fn temporary_path(dest: &Path) -> PathBuf {
     name.push(".algedi-part");
     PathBuf::from(name)
 }
+
+fn remote_path_components(remote_path: &str) -> ProviderResult<Vec<&str>> {
+    let components: Vec<_> = remote_path
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    if components.iter().any(|part| matches!(*part, "." | "..")) {
+        return Err(ProviderError::Other(format!(
+            "unsafe remote folder path: {remote_path:?}"
+        )));
+    }
+    Ok(components)
+}
 fn network_error(error: reqwest::Error) -> ProviderError {
     ProviderError::Network(error.to_string())
 }
@@ -366,5 +400,14 @@ mod tests {
             temporary_path(Path::new("/tmp/report.pdf")),
             PathBuf::from("/tmp/report.pdf.algedi-part")
         );
+    }
+
+    #[test]
+    fn validates_remote_folder_path_components() {
+        assert_eq!(
+            remote_path_components("/Work/2026/").unwrap(),
+            vec!["Work", "2026"]
+        );
+        assert!(remote_path_components("/Work/../Secrets").is_err());
     }
 }

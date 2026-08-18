@@ -355,22 +355,39 @@ impl AccountManager {
         local_path: PathBuf,
         remote_path: String,
     ) -> anyhow::Result<PairId> {
-        let handle = self
+        anyhow::ensure!(
+            local_path.is_dir(),
+            "local path is not an existing directory: {}",
+            local_path.display()
+        );
+        let provider = self
             .handles
-            .get_mut(&account_id)
-            .ok_or_else(|| anyhow::anyhow!("unknown account {account_id}"))?;
+            .get(&account_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown account {account_id}"))?
+            .provider
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("account {account_id} has no active provider"))?;
+        let remote_folder = provider.resolve_folder(&remote_path).await?;
+        anyhow::ensure!(
+            remote_folder.is_folder,
+            "remote path is not a folder: {remote_path}"
+        );
+        anyhow::ensure!(
+            !remote_folder.remote_id.is_empty(),
+            "provider returned an empty folder ID for {remote_path}"
+        );
 
         let pair = FolderPair {
             id: uuid::Uuid::new_v4(),
             account_id,
             local_path,
             remote_path,
-            remote_folder_id: String::new(), // TODO: resolve/create via provider API
+            remote_folder_id: remote_folder.remote_id,
             paused: false,
         };
         self.state.lock().unwrap().insert_folder_pair(&pair)?;
         let id = pair.id;
-        handle.pairs.push(pair);
+        self.handles.get_mut(&account_id).unwrap().pairs.push(pair);
         Ok(id)
     }
 
@@ -575,6 +592,22 @@ mod tests {
             Err(ProviderError::Other("not used in this test".into()))
         }
 
+        async fn resolve_folder(&self, remote_path: &str) -> ProviderResult<RemoteFile> {
+            Ok(RemoteFile {
+                remote_id: format!("folder:{remote_path}"),
+                name: remote_path
+                    .rsplit('/')
+                    .find(|part| !part.is_empty())
+                    .unwrap_or("root")
+                    .into(),
+                parent_id: None,
+                is_folder: true,
+                size: 0,
+                content_hash: None,
+                modified_at: "1970-01-01T00:00:00Z".parse().unwrap(),
+            })
+        }
+
         fn web_url(&self, _remote_id: &str) -> String {
             String::new()
         }
@@ -692,5 +725,37 @@ mod tests {
         assert!(mgr.trigger_sync(uuid::Uuid::new_v4()).await.is_err());
         assert_eq!(mgr.take_sync_requests(), HashSet::from([active]));
         assert!(mgr.take_sync_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn add_folder_pair_resolves_remote_id_before_persisting() {
+        let mut mgr = AccountManager::new_for_test();
+        let seed = mgr.insert_test_pair("gdrive", PathBuf::from("/tmp/seed"), false);
+        let account_id = mgr
+            .handles
+            .values()
+            .find(|handle| handle.pairs.iter().any(|p| p.id == seed))
+            .unwrap()
+            .account
+            .id;
+        mgr.handles.get_mut(&account_id).unwrap().provider = Some(Arc::new(NoopProvider));
+        let local = tempfile::tempdir().unwrap();
+        let pair_id = mgr
+            .add_folder_pair(account_id, local.path().into(), "/Work/2026".into())
+            .await
+            .unwrap();
+        let pair = mgr
+            .handles
+            .get(&account_id)
+            .unwrap()
+            .pairs
+            .iter()
+            .find(|pair| pair.id == pair_id)
+            .unwrap();
+        assert_eq!(pair.remote_folder_id, "folder:/Work/2026");
+        assert!(mgr
+            .add_folder_pair(account_id, local.path().join("missing"), "/Work".into())
+            .await
+            .is_err());
     }
 }
