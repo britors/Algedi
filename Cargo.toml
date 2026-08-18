@@ -13,7 +13,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Lyra OS"]
 license = "GPL-3.0-or-later"
-repository = "https://github.com/lyraos/algedi"
+repository = "https://github.com/britors/Algedi"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "time", "sync"] }
