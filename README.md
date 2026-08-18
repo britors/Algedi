@@ -41,3 +41,8 @@ cargo test --workspace
 
 Em desenvolvimento ativo. Consulte `docs/oauth-setup.md` para o estado atual
 da implementação e limitações conhecidas.
+
+## Licença
+
+Distribuído sob a [GNU General Public License v3.0](LICENSE) (ou, a seu
+critério, qualquer versão posterior).
