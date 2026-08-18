@@ -79,38 +79,51 @@ impl SyncEngine {
 
         let cursor = self.state.lock().unwrap().get_change_cursor(self.pair.id)?;
         let (remote_changes, new_cursor) = self.provider.list_changes(cursor.as_ref()).await?;
-        self.state
-            .lock()
-            .unwrap()
-            .set_change_cursor(self.pair.id, &new_cursor)?;
-
         let mut actions = Vec::with_capacity(remote_changes.len());
         for change in &remote_changes {
             let mut change = change.clone();
-            if matches!(change.kind, ChangeKind::Deleted) && change.file.name.is_empty() {
+            if matches!(change.kind, ChangeKind::Deleted) {
                 let known_path = self
                     .state
                     .lock()
                     .unwrap()
                     .relative_path_for_remote_id(self.pair.id, &change.file.remote_id)?;
-                let Some(known_path) = known_path else {
+                if let Some(known_path) = known_path {
+                    change.file.name = known_path;
+                } else if change.file.parent_id.is_some() {
+                    let Some(relative_path) = self
+                        .provider
+                        .resolve_relative_path(&change.file, &self.pair.remote_folder_id)
+                        .await?
+                    else {
+                        continue;
+                    };
+                    change.file.name = relative_path;
+                } else {
+                    continue;
+                }
+            } else {
+                let Some(relative_path) = self
+                    .provider
+                    .resolve_relative_path(&change.file, &self.pair.remote_folder_id)
+                    .await?
+                else {
                     continue;
                 };
-                change.file.name = known_path;
+                change.file.name = relative_path;
             }
             actions.push(self.classify(&change)?);
         }
+        self.state
+            .lock()
+            .unwrap()
+            .set_change_cursor(self.pair.id, &new_cursor)?;
         Ok(actions)
     }
 
     /// Compares a single remote change against the last-known synced hashes
     /// for that path, per the three-scenario table in PROMPT-ALGEDI.md
     /// sec. 5.2.
-    ///
-    /// NOTE: `RemoteFile` carries no path relative to the pair root; real
-    /// adapters will need to resolve the `parent_id` chain into one. Until
-    /// that lands, `file.name` is treated as a flat, top-level relative
-    /// path — nested folders are not yet supported.
     fn classify(&self, change: &RemoteChange) -> anyhow::Result<SyncAction> {
         let relative_path = change.file.name.clone();
         let local_path = self.pair.local_path.join(&relative_path);
@@ -327,6 +340,7 @@ mod tests {
         changes: Vec<RemoteChange>,
         /// remote_id -> bytes served by `download`.
         contents: Mutex<HashMap<String, Vec<u8>>>,
+        metadata: HashMap<String, RemoteFile>,
     }
 
     impl FakeProvider {
@@ -334,6 +348,7 @@ mod tests {
             Self {
                 changes,
                 contents: Mutex::new(HashMap::new()),
+                metadata: HashMap::new(),
             }
         }
 
@@ -342,6 +357,11 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(remote_id.to_string(), bytes.to_vec());
+            self
+        }
+
+        fn with_metadata(mut self, file: RemoteFile) -> Self {
+            self.metadata.insert(file.remote_id.clone(), file);
             self
         }
     }
@@ -398,8 +418,11 @@ mod tests {
             Ok(())
         }
 
-        async fn get_metadata(&self, _remote_id: &str) -> ProviderResult<RemoteFile> {
-            unimplemented!("not exercised by these tests")
+        async fn get_metadata(&self, remote_id: &str) -> ProviderResult<RemoteFile> {
+            self.metadata
+                .get(remote_id)
+                .cloned()
+                .ok_or_else(|| ProviderError::NotFound(remote_id.into()))
         }
 
         fn web_url(&self, _remote_id: &str) -> String {
@@ -413,10 +436,22 @@ mod tests {
         RemoteFile {
             remote_id: format!("id-{name}"),
             name: name.into(),
-            parent_id: None,
+            parent_id: Some("root".into()),
             is_folder: false,
             size: 0,
             content_hash: Some(hash.into()),
+            modified_at: chrono::Utc::now(),
+        }
+    }
+
+    fn remote_folder(id: &str, name: &str, parent_id: &str) -> RemoteFile {
+        RemoteFile {
+            remote_id: id.into(),
+            name: name.into(),
+            parent_id: Some(parent_id.into()),
+            is_folder: true,
+            size: 0,
+            content_hash: None,
             modified_at: chrono::Utc::now(),
         }
     }
@@ -724,5 +759,54 @@ mod tests {
                 .unwrap(),
             (None, None)
         );
+    }
+
+    #[tokio::test]
+    async fn resolves_nested_remote_path_below_pair_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDb::open_in_memory().unwrap();
+        let pair = test_pair(dir.path().to_path_buf());
+        state.insert_folder_pair(&pair).unwrap();
+        let mut file = remote_file("report.txt", "hash");
+        file.parent_id = Some("year".into());
+        let provider = Arc::new(
+            FakeProvider::new(vec![RemoteChange {
+                file,
+                kind: ChangeKind::Created,
+            }])
+            .with_metadata(remote_folder("year", "2026", "work"))
+            .with_metadata(remote_folder("work", "Work", "root")),
+        );
+        let mut engine = SyncEngine::new(pair, provider, Arc::new(Mutex::new(state)));
+        let actions = engine.run_cycle().await.unwrap();
+        assert_eq!(actions[0].relative_path(), Some("Work/2026/report.txt"));
+    }
+
+    #[tokio::test]
+    async fn ignores_remote_items_outside_pair_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDb::open_in_memory().unwrap();
+        let pair = test_pair(dir.path().to_path_buf());
+        state.insert_folder_pair(&pair).unwrap();
+        let mut file = remote_file("private.txt", "hash");
+        file.parent_id = Some("elsewhere".into());
+        let provider = Arc::new(
+            FakeProvider::new(vec![RemoteChange {
+                file,
+                kind: ChangeKind::Created,
+            }])
+            .with_metadata(remote_folder("elsewhere", "Elsewhere", "other-root"))
+            .with_metadata(RemoteFile {
+                remote_id: "other-root".into(),
+                name: "Other root".into(),
+                parent_id: None,
+                is_folder: true,
+                size: 0,
+                content_hash: None,
+                modified_at: chrono::Utc::now(),
+            }),
+        );
+        let mut engine = SyncEngine::new(pair, provider, Arc::new(Mutex::new(state)));
+        assert!(engine.run_cycle().await.unwrap().is_empty());
     }
 }

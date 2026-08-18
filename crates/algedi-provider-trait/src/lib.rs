@@ -7,6 +7,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -67,13 +68,47 @@ pub trait CloudProvider: Send + Sync {
         cursor: Option<&ChangeCursor>,
     ) -> ProviderResult<(Vec<RemoteChange>, ChangeCursor)>;
 
-    async fn upload(&self, local_path: &Path, remote_parent_id: &str) -> ProviderResult<RemoteFile>;
+    async fn upload(&self, local_path: &Path, remote_parent_id: &str)
+        -> ProviderResult<RemoteFile>;
 
     async fn download(&self, remote_id: &str, dest_path: &Path) -> ProviderResult<()>;
 
     async fn delete(&self, remote_id: &str) -> ProviderResult<()>;
 
     async fn get_metadata(&self, remote_id: &str) -> ProviderResult<RemoteFile>;
+
+    /// Resolves `file` to a safe path below `root_id` by walking its parent
+    /// chain. `None` means the item is outside this synchronized root.
+    async fn resolve_relative_path(
+        &self,
+        file: &RemoteFile,
+        root_id: &str,
+    ) -> ProviderResult<Option<String>> {
+        let mut segments = vec![safe_component(&file.name)?];
+        let mut parent_id = file.parent_id.clone();
+        let mut visited = HashSet::new();
+
+        while let Some(id) = parent_id {
+            if id == root_id {
+                segments.reverse();
+                return Ok(Some(segments.join("/")));
+            }
+            if !visited.insert(id.clone()) || visited.len() > 256 {
+                return Err(ProviderError::Other(
+                    "cycle or excessive depth in remote parent chain".into(),
+                ));
+            }
+            let parent = self.get_metadata(&id).await?;
+            if !parent.is_folder {
+                return Err(ProviderError::Other(format!(
+                    "remote parent {id} is not a folder"
+                )));
+            }
+            segments.push(safe_component(&parent.name)?);
+            parent_id = parent.parent_id;
+        }
+        Ok(None)
+    }
 
     /// Web URL for a file, used by the Nautilus "Ver no <provider>" action.
     fn web_url(&self, remote_id: &str) -> String;
@@ -83,4 +118,16 @@ pub trait CloudProvider: Send + Sync {
     /// must apply this atomically (interior mutability) since the provider
     /// is shared via `Arc` across concurrent in-flight calls.
     fn set_access_token(&self, access_token: String);
+}
+
+fn safe_component(name: &str) -> ProviderResult<String> {
+    let mut components = Path::new(name).components();
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(component)), None) if !component.is_empty() => {
+            Ok(component.to_string_lossy().into_owned())
+        }
+        _ => Err(ProviderError::Other(format!(
+            "unsafe remote path component: {name:?}"
+        ))),
+    }
 }
