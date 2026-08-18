@@ -16,3 +16,4 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 oauth2 = { workspace = true }
 tiny_http = { workspace = true }
+percent-encoding = { workspace = true }

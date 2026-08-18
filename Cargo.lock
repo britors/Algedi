@@ -68,6 +68,7 @@ dependencies = [
  "serde_json",
  "tiny_http",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 
@@ -80,6 +81,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "oauth2",
+ "percent-encoding",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
